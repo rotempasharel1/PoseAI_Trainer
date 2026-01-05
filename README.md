@@ -13,18 +13,18 @@ The code is designed to be **Colab-friendly** and handles dependency installatio
    - Ensure you have a GPU environment (CUDA) for optimal performance.
    - The script will automatically install required libraries: `mediapipe`, `diffusers`, `transformers`, `torch`, etc.
 2. **Data Structure** (Mandatory): The script expects the following directory structure to function correctly:
-   PoseAI_Trainer/
-      ├── poseAI_trainer.py   <--- Main execution script
-      ├── seeds/
-      │   ├── good/           <--- Base images for Good squats
-      │   └── bad/            <--- Base images for Bad squats
-      └── synthetic_dataset/  
-          ├── train/
-          │   ├── good/       <--- Training images (Correct form)
-          │   └── bad/        <--- Training images (Incorrect form)
-          └── val/
-              ├── good/       <--- Validation images (Correct form)
-              └── bad/        <--- Validation images (Incorrect form)
+      PoseAI_Trainer/
+      ├── poseAI_trainer.py       # Main execution script (Sections 5.1-5.3)
+      ├── seeds/                  # Base images for generation
+      │   ├── good/               # Good form seeds
+      │   └── bad/                # Bad form seeds
+      └── synthetic_dataset/      # Training & Validation data
+          ├── train/              # Training images
+          │   ├── good/           # Correct form
+          │   └── bad/            # Incorrect form
+          └── val/                # Validation images
+              ├── good/           # Correct form
+              └── bad/            # Incorrect form
 4. **Execution**:
    - Run the main script/notebook: `poseAI_trainer.py`.
    - **Generation**: By default, generation is disabled to use existing data. To enable, set `ENABLE_GENERATION=1`.
@@ -43,4 +43,5 @@ The code is designed to be **Colab-friendly** and handles dependency installatio
 - **Root Directory**:
   - `poseAI_trainer.py`: Main execution script.
   - `synthetic_dataset_*.zip`: Full datasets.
+
 
