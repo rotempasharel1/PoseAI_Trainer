@@ -1,50 +1,32 @@
-# PoseAITraining — Run Summary
+# Project Name: PoseAI Trainer
 
-## Config
+## 📋 Submission Checklist
+- **Git Link**: Valid and matches project name.
+- **Presentation**: Available in **PPT** and **PDF** in `/interim_report_presentation`.
+- **Data**: All synthetic datasets (Train/Val) uploaded as ZIP files.
+- **Notebooks**: Includes Section 5.1 (Data Gen), 5.2 (EDA), and 5.3 (Baseline/Training).
 
-- Device: cpu
+## 🚀 How to Run
+The code is designed to be **Colab-friendly** and handles dependency installation automatically.
 
-- TOTAL_IMAGES: 2000
+1. **Environment Setup**: 
+   - Ensure you have a GPU environment (CUDA) for optimal performance.
+   - The script will automatically install required libraries: `mediapipe`, `diffusers`, `transformers`, `torch`, etc.
+2. **Execution**:
+   - Run the main script/notebook: `poseAI_trainer.py`.
+   - **Generation**: By default, generation is disabled to use existing data. To enable, set `ENABLE_GENERATION=1`.
+   - **Training**: The script trains a **ViT-B/16** model and saves the best weights to `outputs/vit_squat_best.pth`.
+3. **Outputs**:
+   - After execution, a ZIP artifact `PoseAITraining_artifact.zip` will be created containing all results and a detailed summary.
 
-- VAL_RATIO: 0.2
+## 📂 Repository Layout
+*Note: Large ZIP files are kept in the root directory due to size constraints.*
 
-- TEST_RATIO: 0.0
-
-- WARMUP_EPOCHS: 1
-
-- FINETUNE_EPOCHS: 4
-
-- UNFREEZE_LAST_BLOCKS: 4
-
-
-## Outputs
-
-- `outputs/eda_*.png` + `outputs/eda_*json` + `outputs/eda_*.csv` (expanded EDA)
-
-- `outputs/*_predictions.csv` (includes keep/improve/summary columns)
-
-- `outputs/confusion_*.png` + `outputs/classification_report_*.json`
-
-- `outputs/vit_squat.pth` + `outputs/vit_squat_best.pth`
-
-- `outputs/PoseAITraining_artifact.zip`
-
-
-## Notes
-
-TEST split is empty (TEST_RATIO=0). For convenience, test reports reuse val.
-
-
-## Metrics
-
-### val
-
-- n = 400
-
-- accuracy = 0.7875
-
-### test
-
-- n = 400
-
-- accuracy = 0.7875
+- **`/interim_report_presentation`**:
+  - `PoseAI_Trainer.pptx` & `PoseAI_Trainer.pdf`.
+- **`outputs/`**: Generated after run (also available in `outputs.zip`):
+  - **EDA**: Visuals and stats (`eda_class_counts.png`, `eda_stats.csv`).
+  - **Baseline**: Training results (`confusion_test.png`, `test_predictions.csv`).
+- **Root Directory**:
+  - `poseAI_trainer.py`: Main execution script.
+  - `synthetic_dataset_*.zip`: Full datasets.
