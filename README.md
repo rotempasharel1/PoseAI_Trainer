@@ -9,10 +9,21 @@
 ## 🚀 How to Run
 The code is designed to be **Colab-friendly** and handles dependency installation automatically.
 
-1. **Environment Setup**: 
-   - Ensure you have a GPU environment (CUDA) for optimal performance.
-   - The script will automatically install required libraries: `mediapipe`, `diffusers`, `transformers`, `torch`, etc.
-2. **Data Structure** (Mandatory): The script expects the following directory structure to function correctly:
+1. **Environment Setup**:
+   Tip: A GPU (CUDA) is highly recommended for generation and training.
+   Manual Installation (Recommended for Local PC):   - The script will automatically install required libraries: `mediapipe`, `diffusers`, `transformers`, `torch`, etc.
+      1. Create and activate a virtual environment
+      python -m venv venv
+      source venv/bin/activate  # Linux/Mac
+      venv\Scripts\activate     # Windows
+      
+      2. Upgrade pip and install dependencies
+      python -m pip install --upgrade pip
+      pip install mediapipe diffusers transformers accelerate safetensors opencv-python pillow numpy pandas scikit-learn matplotlib tqdm torch torchvision
+
+     Note: The script poseAI_trainer.py also contains an internal ensure_deps() function to verify these libraries.
+      
+3. **Data Structure** (Mandatory): The script expects the following directory structure to function correctly:
    <img width="500" height="2000" alt="image" src="https://github.com/user-attachments/assets/1d36269d-4c81-43fb-9723-b21b695395d3" />
 
 4. **Execution**:
@@ -33,6 +44,7 @@ The code is designed to be **Colab-friendly** and handles dependency installatio
 - **Root Directory**:
   - `poseAI_trainer.py`: Main execution script.
   - `synthetic_dataset_*.zip`: Full datasets.
+
 
 
 
