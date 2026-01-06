@@ -33,6 +33,15 @@ The code is designed to be **Colab-friendly** and handles dependency installatio
 5. **Outputs**:
    - After execution, a ZIP artifact `PoseAITraining_artifact.zip` will be created containing all results and a detailed summary.
 
+## 📝 Results (CSV)
+The final analysis is saved in outputs/test_predictions.csv (or val_predictions.csv). This file includes the core classification and the LLM-generated feedback in the following columns:
+
+keep_1, keep_2: Positive points identified in the performance.
+
+improve_1, improve_2: Points for improvement.
+
+llm_summary: A comprehensive textual summary of the pose analysis.
+
 ## 📂 Repository Layout
 *Note: Large ZIP files are kept in the root directory due to size constraints.*
 
@@ -44,6 +53,7 @@ The code is designed to be **Colab-friendly** and handles dependency installatio
 - **Root Directory**:
   - `poseAI_trainer.py`: Main execution script.
   - `synthetic_dataset_*.zip`: Full datasets.
+
 
 
 
