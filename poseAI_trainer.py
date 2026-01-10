@@ -81,6 +81,7 @@ def ensure_deps():
         import importlib
         importlib.invalidate_caches()
 
+ensure_deps()
 
 import cv2
 import numpy as np
@@ -95,6 +96,7 @@ from tqdm import tqdm
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
 from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 
 from torchvision import models, transforms
 from torch.utils.data import Dataset, DataLoader
@@ -113,6 +115,9 @@ from diffusers import DPMSolverMultistepScheduler
 @dataclass
 class CFG:
     TOTAL_IMAGES: int = 2000
+    BATCH_SIZE: int = 16
+    FINETUNE_EPOCHS: int = 4
+    UNFREEZE_LAST_BLOCKS: int = 4
 
     VAL_RATIO: float = 0.2
     TEST_RATIO: float = 0.0 
@@ -147,10 +152,6 @@ class CFG:
     BAD_FROM_BADSEEDS_FRACTION_TRAIN: float = 0.25
 
     WARMUP_EPOCHS: int = 1
-    FINETUNE_EPOCHS: int = 4
-    UNFREEZE_LAST_BLOCKS: int = 4
-
-    BATCH_SIZE: int = 16
     LR_WARMUP: float = 2e-4
     LR_FINETUNE: float = 6e-5
     WEIGHT_DECAY: float = 1e-4
@@ -716,7 +717,7 @@ def _image_stats_one(path: Path) -> Dict[str, float]:
     return {"brightness": brightness, "contrast": contrast, "sharpness": sharpness, "size_kb": size_kb}
 
 def run_eda(max_per_bucket: int = 250):
-    print("\n=== EDA (expanded) ===")
+    print("\n=== EDA (focused) ===")
 
     counts = []
     for split in ["train", "val", "test"]:
@@ -762,17 +763,8 @@ def run_eda(max_per_bucket: int = 250):
 
     stats_df = pd.DataFrame(stats_rows) if stats_rows else pd.DataFrame()
     if not stats_df.empty:
-        for col in ["brightness", "sharpness", "size_kb"]:
-            fig = plt.figure()
-            for (split, label), g in stats_df.groupby(["split","label"]):
-                plt.hist(g[col].values, bins=30, alpha=0.5, label=f"{split}-{label}")
-            plt.title(f"EDA histogram: {col}")
-            plt.xlabel(col)
-            plt.ylabel("count")
-            plt.legend()
-            fig.tight_layout()
-            fig.savefig(OUTPUT_DIR / f"eda_hist_{col}.png", dpi=150)
-            plt.close(fig)
+        # Removed sharpness histogram to focus on model success metrics instead
+        pass
 
         summary = (
             stats_df.groupby(["split","label"])[["brightness","contrast","sharpness","size_kb"]]
@@ -789,8 +781,7 @@ def run_eda(max_per_bucket: int = 250):
                 rec[f"{metric}_max"]  = float(row[(metric,"max")])
             summary_records.append(rec)
         (OUTPUT_DIR / "eda_stats_summary.json").write_text(json.dumps(summary_records, indent=2), encoding="utf-8")
-
-        stats_df.to_csv(OUTPUT_DIR / "eda_stats.csv", index=False)
+    print("✅ EDA saved: outputs/eda_class_counts.png")
 
     report = {
         "device": DEVICE,
@@ -942,8 +933,13 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose]]:
 
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-    torch.save(model.state_dict(), OUTPUT_DIR / "vit_squat.pth")
-    print(f"✅ Saved model to outputs/vit_squat.pth (best val acc={best_val_acc:.4f})")
+    
+    # Cleanup best_path immediately after loading to keep outputs clean
+    try:
+        if best_path.exists():
+            best_path.unlink()
+    except Exception: pass
+
     return model, eval_tf
 
 
@@ -973,26 +969,20 @@ def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, tit
     plt.close(fig)
 
 def _fallback_feedback(true_label: str, pred_label: str, confidence: float) -> Dict[str, str]:
-    keep_1 = "Keep full-body framing with hips/knees/ankles visible."
-    keep_2 = "Keep consistent lighting and avoid motion blur."
+    keep = "Maintain clear visibility of hip, knee, and ankle joints with consistent lighting."
 
     if true_label == "good" and pred_label == "bad":
-        improve_1 = "Add more GOOD variety (angles/body types) and keep knees tracking over toes + neutral spine."
-        improve_2 = "Reduce forward-lean cues in GOOD images; ensure heels stay flat."
+        improve = "Refine 'good' examples: Ensure heels remain flat, knees track strictly over toes, and spine maintains neutral alignment. Avoid ambiguous camera angles."
     elif true_label == "bad" and pred_label == "good":
-        improve_1 = "Add more BAD examples emphasizing knee valgus + heel lift + excessive torso lean."
-        improve_2 = "Add 'borderline' bad squats (subtle faults) to sharpen the decision boundary."
+        improve = "Clarify 'bad' examples: Exaggerate specific faults (e.g., severe knee valgus, heel lift, rounded back) to create a distinct decision boundary from neutral poses."
     else:
-        improve_1 = "Add more viewpoint diversity and backgrounds to improve robustness."
-        improve_2 = "Increase pose-fault diversity (valgus, hip shift, butt wink, heel lift)."
+        improve = "Diversify camera angles and background environments to improve model robustness against visual variations."
 
-    summary = f"pred={pred_label} conf={confidence:.2f}. keep: {keep_1} | improve: {improve_1}"
+    summary = f"pred={pred_label}. {keep} {improve}"
     return {
         "llm_generator": "fallback",
-        "keep_1": keep_1,
-        "keep_2": keep_2,
-        "improve_1": improve_1,
-        "improve_2": improve_2,
+        "keep": keep,
+        "improve": improve,
         "llm_summary": summary,
     }
 
@@ -1007,9 +997,10 @@ def _openai_feedback_optional(true_label: str, pred_label: str, confidence: floa
 
     try:
         msg = (
-            "Return JSON with keys: keep_1, keep_2, improve_1, improve_2, llm_summary.\n"
+            "Return JSON with keys: keep, improve, llm_summary.\n"
             f"True label: {true_label}\nPred label: {pred_label}\nConfidence: {confidence:.2f}\n"
-            "Style: short coaching tips."
+            "Style: High-quality, precise technical coaching tips for computer vision dataset improvement.\n"
+            "Provide ONE strong 'keep' point (what is good about data quality) and ONE actionable 'improve' point (how to fix the squat form or data labeling)."
         )
         client = openai.OpenAI(api_key=api_key) 
         resp = client.chat.completions.create(
@@ -1024,10 +1015,8 @@ def _openai_feedback_optional(true_label: str, pred_label: str, confidence: floa
         data = json.loads(m.group(0))
         return {
             "llm_generator": "openai",
-            "keep_1": str(data.get("keep_1","")).strip(),
-            "keep_2": str(data.get("keep_2","")).strip(),
-            "improve_1": str(data.get("improve_1","")).strip(),
-            "improve_2": str(data.get("improve_2","")).strip(),
+            "keep": str(data.get("keep","")).strip(),
+            "improve": str(data.get("improve","")).strip(),
             "llm_summary": str(data.get("llm_summary","")).strip(),
         }
     except Exception:
@@ -1039,7 +1028,7 @@ def _attach_llm_columns(df: pd.DataFrame, max_openai: int = 60) -> pd.DataFrame:
         return df
 
     df = df.copy()
-    for col in ["llm_generator","keep_1","keep_2","improve_1","improve_2","llm_summary"]:
+    for col in ["llm_generator","keep","improve","llm_summary"]:
         df[col] = ""
 
     cand = df.copy()
@@ -1066,6 +1055,42 @@ def _attach_llm_columns(df: pd.DataFrame, max_openai: int = 60) -> pd.DataFrame:
             df.at[i, k] = v
 
     return df
+
+def plot_performance_metrics(df: pd.DataFrame, split_name: str):
+    # 1. Confidence Histogram
+    plt.figure(figsize=(7, 5))
+    corr = df[df["correct"] == True]["confidence"]
+    incorr = df[df["correct"] == False]["confidence"]
+    
+    plt.hist(corr, bins=20, alpha=0.6, color="green", label="Correct")
+    plt.hist(incorr, bins=20, alpha=0.6, color="red", label="Incorrect")
+    plt.xlabel("Confidence Score")
+    plt.ylabel("Count")
+    plt.title(f"Model Confidence: Correct vs Incorrect ({split_name})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
+    plt.close()
+
+    # 2. ROC Curve
+    if "p_good" in df.columns and "true_label" in df.columns:
+        y_true = (df["true_label"] == "good").astype(int)
+        y_scores = df["p_good"]
+        fpr, tpr, _ = roc_curve(y_true, y_scores)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
+        plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC Curve ({split_name})")
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
+        plt.close()
 
 def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform) -> Tuple[pd.DataFrame, Dict]:
     ds = SquatDataset(split_dir, transform=transform)
@@ -1107,15 +1132,15 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
     df = _attach_llm_columns(df)
 
-    df.to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
+    plot_performance_metrics(df, split_name)
+
+    # Save CSV without confidence and p_bad as requested
+    cols_to_save = [c for c in df.columns if c not in ["confidence", "p_bad"]]
+    df[cols_to_save].to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
     save_confusion_matrix(cm, ["bad", "good"], OUTPUT_DIR / f"confusion_{split_name}.png",
                           title=f"Confusion Matrix ({split_name})")
-
-    rep = classification_report(all_y, all_p, target_names=["bad", "good"], output_dict=True)
-    with open(OUTPUT_DIR / f"classification_report_{split_name}.json", "w", encoding="utf-8") as f:
-        json.dump(rep, f, indent=2)
 
     summary = {
         "split": split_name,
@@ -1143,6 +1168,7 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append(f"- UNFREEZE_LAST_BLOCKS: {cfg.UNFREEZE_LAST_BLOCKS}\n")
     lines.append("\n## Outputs\n")
     lines.append("- `outputs/eda_*.png` + `outputs/eda_*json` + `outputs/eda_*.csv` (expanded EDA)\n")
+    lines.append("- `outputs/eda_class_counts.png` + `outputs/eda_hist_sharpness.png` (Focused EDA)\n")
     lines.append("- `outputs/*_predictions.csv` (includes keep/improve/summary columns)\n")
     lines.append("- `outputs/confusion_*.png` + `outputs/classification_report_*.json`\n")
     lines.append("- `outputs/vit_squat.pth` + `outputs/vit_squat_best.pth`\n")
@@ -1231,11 +1257,6 @@ def main():
         print("👉 Set ENABLE_GENERATION=1 and rerun if you want to generate.")
         return
 
-    if os.environ.get("SKIP_EDA", "0") != "1":
-        run_eda()
-    else:
-        print("⚠️ SKIP_EDA=1 -> skipping EDA")
-
     model, transform = (None, None)
     if os.environ.get("SKIP_TRAIN", "0") != "1":
         model, transform = train_vit()
@@ -1252,31 +1273,21 @@ def main():
             model.to(DEVICE)
             _, transform = _make_transforms()
             print("✅ Loaded existing model from vit_squat_best.pth")
+            
+            # Remove the temporary model file to keep outputs clean
+            try:
+                best_path.unlink()
+            except Exception: pass
         else:
             print("❌ No model found, cannot evaluate.")
             return
 
     val_df, val_summary = evaluate_split(model, VAL_DIR, "val", transform)
 
-    test_note = ""
-    if count_images(TEST_DIR/"good") + count_images(TEST_DIR/"bad") == 0:
-        test_note = "TEST split is empty (TEST_RATIO=0). For convenience, test reports reuse val."
-        test_df = val_df.copy()
-        test_df["split"] = "test"
-        test_df.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
-        shutil.copyfile(OUTPUT_DIR / "confusion_val.png", OUTPUT_DIR / "confusion_test.png")
-        shutil.copyfile(OUTPUT_DIR / "classification_report_val.json", OUTPUT_DIR / "classification_report_test.json")
-        test_summary = {
-            "split": "test",
-            "n": int(len(test_df)),
-            "accuracy": float(test_df["correct"].mean() if len(test_df) else 0.0),
-            "confusion_matrix": val_summary.get("confusion_matrix", []),
-        }
-    else:
-        _test_df, test_summary = evaluate_split(model, TEST_DIR, "test", transform)
+    # Test predictions disabled by request
+    test_summary = {}
+    test_note = "Test predictions disabled."
 
-    write_readme([val_summary, test_summary], note=test_note)
-    zip_artifact()
 
     print("\n✅ DONE. Check outputs/")
 
