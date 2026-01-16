@@ -12,8 +12,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
-from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report, f1_score
 
+from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
 
 # ============================================================
 # 0) Dependency setup (Colab-friendly, with REAL validation)
@@ -96,12 +96,9 @@ import torch
 import torch.nn as nn
 
 from PIL import Image
-from tqdm import tqdm
 
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
-
-from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
 
 from torchvision import models, transforms
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -123,10 +120,6 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     s = os.environ.get(name, "").strip()
     return float(s) if s else default
-
-def _env_str(name: str, default: str) -> str:
-    s = os.environ.get(name, "").strip()
-    return s if s else default
 
 @dataclass
 class CFG:
@@ -186,7 +179,7 @@ class CFG:
 
 cfg = CFG()
 
-# override from env (handy for experiments)
+# override from env
 cfg.TOTAL_IMAGES = _env_int("TOTAL_IMAGES", cfg.TOTAL_IMAGES)
 cfg.FINETUNE_EPOCHS = _env_int("FINETUNE_EPOCHS", cfg.FINETUNE_EPOCHS)
 cfg.WARMUP_EPOCHS = _env_int("WARMUP_EPOCHS", cfg.WARMUP_EPOCHS)
@@ -226,6 +219,31 @@ for d in [
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+
+# ============================================================
+# Minimal outputs mode
+# ============================================================
+MINIMAL_OUTPUT = os.environ.get("MINIMAL_OUTPUT", "1") == "1"
+
+def allowed_output_files() -> set:
+    return {
+        "val_predictions.csv",
+        "confidence_dist_val.png",
+        "confusion_val.png",
+        "roc_curve_val.png",
+        "README.md",
+    }
+
+def prune_outputs_dir():
+    if not OUTPUT_DIR.exists():
+        return
+    keep = allowed_output_files()
+    for p in OUTPUT_DIR.rglob("*"):
+        if p.is_file() and p.name not in keep:
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
 # ============================================================
 # 3) Utilities
@@ -270,7 +288,6 @@ def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 def num_workers_auto() -> int:
-    # windows tends to be fragile with >0 without guard
     return 0 if os.name == "nt" else 2
 
 # ============================================================
@@ -289,7 +306,7 @@ def _lm_vec(lms, idx: int) -> np.ndarray:
     return np.array([lm.x, lm.y, lm.z], dtype=np.float32)
 
 # ============================================================
-# 5) Skeleton tree + FK + 3D dragging (improves realism/diversity)
+# 5) Skeleton tree + FK + 3D dragging
 # ============================================================
 class SkeletonNode:
     def __init__(self, name: str, parent: Optional["SkeletonNode"]=None, landmark_idx: Optional[int]=None):
@@ -303,11 +320,6 @@ class SkeletonNode:
             parent.children.append(self)
 
 def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, SkeletonNode], Dict[int, np.ndarray]]:
-    """
-    Returns:
-      root + node_map for manipulatable joints,
-      base_pts: all 33 pose landmark points centered at mid-hip (for a full control map).
-    """
     lms = world_landmarks.landmark
 
     LH = mp_pose.PoseLandmark.LEFT_HIP.value
@@ -318,7 +330,6 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
     mid_hip = (_lm_vec(lms, LH) + _lm_vec(lms, RH)) / 2.0
     mid_shoulder = (_lm_vec(lms, LS) + _lm_vec(lms, RS)) / 2.0
 
-    # full 3D points (centered) for all landmarks (important for a richer control skeleton)
     base_pts: Dict[int, np.ndarray] = {}
     for i in range(len(lms)):
         base_pts[i] = (_lm_vec(lms, i) - mid_hip).astype(np.float32)
@@ -426,10 +437,6 @@ def _norm(v: np.ndarray) -> float:
     return float(np.linalg.norm(v) + 1e-8)
 
 def drag_joint_keep_bone_length(node: SkeletonNode, target_world: np.ndarray):
-    """
-    Simple IK-ish: keep bone length (|local|) but rotate direction so the node reaches target as close as possible.
-    Works well for 'drag knee inward', 'raise ankle', etc.
-    """
     if node.parent is None:
         return
     parent = node.parent
@@ -442,7 +449,6 @@ def drag_joint_keep_bone_length(node: SkeletonNode, target_world: np.ndarray):
     node.local_pos = (new_dir * L).astype(np.float32)
 
 def make_good_pose_jitter(root: SkeletonNode, node_map: Dict[str, SkeletonNode]):
-    # small jitter improves diversity of "good" images without changing label
     def rng(a, b): return random.uniform(a, b)
     if "MID_SHOULDER" in node_map and random.random() < 0.7:
         apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_y(rng(-6, 6)))
@@ -453,14 +459,9 @@ def make_good_pose_jitter(root: SkeletonNode, node_map: Dict[str, SkeletonNode])
     update_world_positions(root)
 
 def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> List[str]:
-    """
-    Richer 'bad' generation: mix rotations + true 3D dragging (bone-length preserving).
-    Produces multiple plausible failure modes, improving training signal.
-    """
     def rng(a, b): return random.uniform(a, b)
     faults: List[str] = []
 
-    # Choose multiple faults per sample
     if random.random() < 0.85: faults.append("forward_lean")
     if random.random() < 0.75: faults.append("knee_valgus")
     if random.random() < 0.50: faults.append("heel_lift")
@@ -468,27 +469,22 @@ def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> L
     if random.random() < 0.35: faults.append("torso_twist")
     if random.random() < 0.25: faults.append("depth_shallow")
 
-    # 1) forward lean: rotate torso around X (pitch)
     if "forward_lean" in faults and "MID_SHOULDER" in node_map:
         apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_x(rng(20, 45)))
 
-    # 2) torso twist: yaw + small roll
     if "torso_twist" in faults and "MID_SHOULDER" in node_map:
         apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_y(rng(-18, 18)))
         apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_z(rng(-10, 10)))
 
-    # 3) knee valgus: DRAG knees toward midline (x -> 0)
     if "knee_valgus" in faults:
         for kn in ["LEFT_KNEE", "RIGHT_KNEE"]:
             if kn in node_map:
                 k = node_map[kn]
-                # move x toward 0 (midline) and a bit forward/back
                 target = k.world_pos.copy()
-                target[0] *= rng(0.35, 0.65)  # collapse inward
+                target[0] *= rng(0.35, 0.65)
                 target[2] += rng(-0.05, 0.05)
                 drag_joint_keep_bone_length(k, target)
 
-    # 4) heel lift: DRAG ankles upward (y) and slightly forward (z)
     if "heel_lift" in faults:
         for an in ["LEFT_ANKLE", "RIGHT_ANKLE"]:
             if an in node_map:
@@ -498,7 +494,6 @@ def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> L
                 target[2] += rng(-0.05, 0.10)
                 drag_joint_keep_bone_length(a, target)
 
-    # 5) hip shift: shift pelvis lateral (simulate asymmetry)
     if "hip_shift" in faults:
         shift = rng(-0.12, 0.12)
         for hn in ["LEFT_HIP", "RIGHT_HIP"]:
@@ -508,7 +503,6 @@ def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> L
                 target[0] += shift * (1.0 if hn == "LEFT_HIP" else -1.0)
                 drag_joint_keep_bone_length(h, target)
 
-    # 6) shallow depth: reduce knee flexion by dragging knees upward a bit
     if "depth_shallow" in faults:
         for kn in ["LEFT_KNEE", "RIGHT_KNEE"]:
             if kn in node_map:
@@ -533,7 +527,7 @@ def sample_camera_params() -> Dict[str, float]:
     }
 
 def project_3d_to_2d(points_3d: Dict[int, np.ndarray], cam: Dict[str, float],
-                    width: int, height: int, margin: float) -> Dict[int, Dict[str, float]]:
+                     width: int, height: int, margin: float) -> Dict[int, Dict[str, float]]:
     y = math.radians(cam["yaw"])
     p = math.radians(cam["pitch"])
     r = math.radians(cam["roll"])
@@ -648,7 +642,6 @@ def plan_targets(total_images: int) -> Dict[str, Dict[str, int]]:
 def generate_synthetic_dataset(total_images: int):
     print(f"\n=== Stage 1: Synthetic dataset (3D pose → manipulate → ControlNet Img2Img) on {DEVICE} ===")
 
-    # diffusion on cpu is painfully slow; keep explicit
     if DEVICE != "cuda" and os.environ.get("ALLOW_CPU_GENERATION", "0") != "1":
         print("❌ Generation requires CUDA by default. Set ALLOW_CPU_GENERATION=1 to force CPU (slow).")
         return
@@ -680,7 +673,6 @@ def generate_synthetic_dataset(total_images: int):
 
     pipe = load_pipe()
 
-    # cache per seed: (root,node_map,init_img,base_pts)
     pose_cache: Dict[str, Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image, Dict[int, np.ndarray]]] = {}
 
     def get_pose_and_init(seed_path: Path) -> Optional[Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image, Dict[int, np.ndarray]]]:
@@ -717,7 +709,6 @@ def generate_synthetic_dataset(total_images: int):
 
         faults: List[str] = []
         if label == "good":
-            # jitter "good" to increase diversity
             if random.random() < 0.7:
                 make_good_pose_jitter(root, node_map)
         else:
@@ -743,7 +734,6 @@ def generate_synthetic_dataset(total_images: int):
         if DEVICE == "cuda":
             ctx = torch.autocast(device_type="cuda", dtype=TORCH_DTYPE)
         else:
-            # no autocast on cpu
             class _NoCtx:
                 def __enter__(self): return None
                 def __exit__(self, exc_type, exc, tb): return False
@@ -767,7 +757,6 @@ def generate_synthetic_dataset(total_images: int):
         out_path = SYNTH_DIR / split / label / fname
         _save_image(out, out_path)
 
-        # save metadata per image (useful for report)
         meta = {
             "label": label,
             "source": source,
@@ -788,11 +777,9 @@ def generate_synthetic_dataset(total_images: int):
             if not ok:
                 continue
 
-    # Good: from good seeds
     fill_split("train", "good", targets["train"]["good"], rr_train_good, source="good_from_goodseeds")
     fill_split("val",   "good", targets["val"]["good"],   rr_val_good,   source="good_from_goodseeds")
 
-    # Bad: mostly from manipulated good seeds, plus optional from bad seeds
     train_bad_target = targets["train"]["bad"]
     train_bad_from_badseeds = 0
     if cfg.SYNTH_BAD_FROM_BADSEEDS and bad_seeds and train_bad_target > 0:
@@ -812,34 +799,7 @@ def generate_synthetic_dataset(total_images: int):
     })
 
 # ============================================================
-# 8) Lightweight EDA (counts + class balance)
-# ============================================================
-def run_eda_counts():
-    rows = []
-    for split in ["train", "val", "test"]:
-        for label in ["good", "bad"]:
-            rows.append({
-                "split": split,
-                "label": label,
-                "count": count_images(SYNTH_DIR / split / label),
-            })
-    df = pd.DataFrame(rows)
-    df.to_csv(OUTPUT_DIR / "eda_counts.csv", index=False)
-
-    pivot = df.pivot(index="split", columns="label", values="count").fillna(0)
-    ax = pivot.plot(kind="bar")
-    ax.set_title("Class counts per split")
-    ax.set_xlabel("Split")
-    ax.set_ylabel("Count")
-    fig = ax.get_figure()
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "eda_class_counts.png", dpi=150)
-    plt.close(fig)
-
-    print("✅ EDA saved: outputs/eda_counts.csv + outputs/eda_class_counts.png")
-
-# ============================================================
-# 9) Dataset & Transforms (improved for generalization)
+# 8) Dataset & Transforms
 # ============================================================
 class SquatDataset(Dataset):
     def __init__(self, root_dir: Path, transform=None):
@@ -883,13 +843,11 @@ def _make_transforms():
     return train_tf, eval_tf
 
 # ============================================================
-# 10) Training (better schedule + early stopping + optional mixup)
+# 9) Training
 # ============================================================
 def _unfreeze_last_blocks(model: nn.Module, n_blocks: int):
-    # freeze all
     for p in model.parameters():
         p.requires_grad = False
-    # unfreeze head
     for p in model.heads.parameters():
         p.requires_grad = True
 
@@ -908,14 +866,11 @@ def _accuracy_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
     return float((pred == y).float().mean().item())
 
 def _soft_cross_entropy(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
-    # target_probs: (B, C) probabilities
     logp = torch.log_softmax(logits, dim=1)
     return -(target_probs * logp).sum(dim=1).mean()
 
 def _mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    # y is class indices => return soft labels
     if alpha <= 0:
-        # convert to one-hot anyway
         y_oh = torch.zeros((y.size(0), 2), device=y.device, dtype=torch.float32)
         y_oh.scatter_(1, y.view(-1, 1), 1.0)
         return x, y_oh
@@ -946,7 +901,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         print("❌ Missing training/val data in synthetic_dataset/.")
         return None, None, {}
 
-    # class weights (even if balanced, keeps stable if mismatch)
     ys = [y for _, y in train_ds.samples]
     n0 = max(1, sum(1 for y in ys if y == 0))
     n1 = max(1, sum(1 for y in ys if y == 1))
@@ -959,7 +913,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     model.heads.head = nn.Linear(model.heads.head.in_features, 2)
     model.to(DEVICE)
 
-    # warmup: head only
     _unfreeze_last_blocks(model, n_blocks=0)
 
     num_workers = num_workers_auto()
@@ -970,19 +923,15 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     last_path = OUTPUT_DIR / "vit_squat_last.pth"
     log_path  = OUTPUT_DIR / "train_log.csv"
 
-    # optimizer
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.LR_WARMUP,
         weight_decay=cfg.WEIGHT_DECAY
     )
 
-    # criterion: label smoothing for hard labels (when mixup off)
     ce = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
-
     scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
 
-    # simple cosine schedule (per epoch) – warmup uses LR_WARMUP, finetune uses LR_FINETUNE
     def set_lr(lr: float):
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -1005,7 +954,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     best_val_acc = -1.0
     no_improve = 0
 
-    # ---- Warmup ----
     for epoch in range(cfg.WARMUP_EPOCHS):
         model.train()
         set_lr(cfg.LR_WARMUP)
@@ -1048,7 +996,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         else:
             no_improve += 1
 
-    # ---- Fine-tune: unfreeze last blocks ----
     _unfreeze_last_blocks(model, n_blocks=cfg.UNFREEZE_LAST_BLOCKS)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1059,7 +1006,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     for epoch in range(cfg.FINETUNE_EPOCHS):
         model.train()
 
-        # cosine lr over epochs
         t = epoch / max(1, cfg.FINETUNE_EPOCHS - 1)
         lr = cfg.LR_FINETUNE * (0.5 * (1.0 + math.cos(math.pi * t)))
         set_lr(lr)
@@ -1078,7 +1024,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
                     x_mix, y_soft = _mixup_batch(x, y, cfg.MIXUP_ALPHA)
                     logits = model(x_mix)
                     loss = _soft_cross_entropy(logits, y_soft) / cfg.GRAD_ACCUM_STEPS
-                    # for reporting acc use hard labels without mixup
                     acc = _accuracy_from_logits(logits.detach(), torch.argmax(y_soft, dim=1))
                 else:
                     logits = model(x)
@@ -1114,10 +1059,9 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
             print(f"🛑 Early stopping: no val improvement for {cfg.EARLY_STOP_PATIENCE} epochs.")
             break
 
-    # save logs
+    # Save logs & weights (will be pruned in minimal mode)
     pd.DataFrame(history_rows).to_csv(log_path, index=False)
 
-    # load best
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
     torch.save(model.state_dict(), last_path)
@@ -1132,7 +1076,7 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     return model, eval_tf, info
 
 # ============================================================
-# 11) Evaluation (rich CSV + plots + confusion + accuracy)
+# 10) Evaluation + plots + LLM-like feedback columns
 # ============================================================
 def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, title: str):
     fig = plt.figure()
@@ -1192,6 +1136,78 @@ def plot_performance_metrics(df: pd.DataFrame, split_name: str):
         plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
         plt.close()
 
+# ---- LLM-like feedback (no API key required) — ENGLISH ONLY
+def _english_feedback_templates():
+    keep_good = [
+        "Heels stay grounded throughout the movement",
+        "Knees track in line with the toes (no inward collapse)",
+        "Neutral spine with chest up",
+        "Controlled tempo on the way down and up",
+    ]
+    improve_good = [
+        "Keep knees from collapsing inward (valgus control)",
+        "Maintain flat feet (avoid heel lift)",
+        "Keep a neutral lower back (avoid rounding)",
+        "Maintain controlled depth without losing balance",
+        "Reduce excessive forward torso lean",
+    ]
+
+    keep_bad = [
+        "Move in a controlled tempo (avoid rushing)",
+        "Keep gaze forward with chest up",
+        "Maintain stable foot placement at a comfortable stance width",
+    ]
+    improve_bad = [
+        "Prevent knees collapsing inward (valgus)",
+        "Avoid heel lift—shift pressure toward heel/midfoot",
+        "Reduce forward torso lean and keep a neutral spine",
+        "Stabilize the pelvis (avoid lateral hip shift/asymmetry)",
+        "Improve depth gradually while maintaining stability",
+    ]
+    return keep_good, improve_good, keep_bad, improve_bad
+
+def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
+    keep_good, improve_good, keep_bad, improve_bad = _english_feedback_templates()
+
+    # Base feedback based on the TRUE label
+    if true_label == "good":
+        keep = " ; ".join(random.sample(keep_good, k=min(2, len(keep_good))))
+        improve = " ; ".join(random.sample(improve_good, k=min(2, len(improve_good))))
+        base = "Overall good technique—preserve the fundamentals and refine a couple of details."
+    else:
+        keep = " ; ".join(random.sample(keep_bad, k=min(2, len(keep_bad))))
+        improve = " ; ".join(random.sample(improve_bad, k=min(2, len(improve_bad))))
+        base = "Technique needs improvement—focus on a few key fixes with controlled reps."
+
+    # Add model-related note
+    note = ""
+    if not correct:
+        note = "⚠️ The model misclassified this example—consider a quick manual review."
+    elif confidence < 0.70:
+        note = "ℹ️ Lower confidence—this may be a borderline or challenging image (angle/lighting/occlusion)."
+
+    summary = base if not note else f"{base} {note}"
+    return {"llm_keep": keep, "llm_improve": improve, "llm_summary": summary}
+
+def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keeps, improves, sums = [], [], []
+    for _, r in df.iterrows():
+        fb = llm_feedback_for_row(
+            true_label=str(r.get("true_label", "")),
+            pred_label=str(r.get("pred_label", "")),
+            confidence=float(r.get("confidence", 0.0)),
+            correct=bool(r.get("correct", False)),
+        )
+        keeps.append(fb["llm_keep"])
+        improves.append(fb["llm_improve"])
+        sums.append(fb["llm_summary"])
+
+    df["llm_keep"] = keeps
+    df["llm_improve"] = improves
+    df["llm_summary"] = sums
+    return df
+
+
 def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform) -> Tuple[pd.DataFrame, Dict]:
     ds = SquatDataset(split_dir, transform=transform)
     if len(ds) == 0:
@@ -1217,6 +1233,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
                 true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
                 conf = float(np.max(probs[j]))
+
                 rows.append({
                     "split": split_name,
                     "image_name": names[j],
@@ -1224,7 +1241,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
                     "pred_label": "good" if pred_y == 1 else "bad",
                     "confidence": conf,
                     "correct": (true_y == pred_y),
-                    "p_bad": float(probs[j][0]),
                     "p_good": float(probs[j][1]),
                 })
                 all_y.append(true_y)
@@ -1232,27 +1248,16 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
     df = pd.DataFrame(rows)
 
-    # save rich CSV (keep p_good, remove p_bad optional)
-    cols_to_save = [c for c in df.columns if c != "p_bad"]
-    df[cols_to_save].to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
+    # ✅ add LLM-like feedback columns
+    df = add_llm_columns(df)
+
+    # Save predictions CSV
+    df.to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
     save_confusion_matrix(cm, ["bad", "good"], OUTPUT_DIR / f"confusion_{split_name}.png",
                           title=f"Confusion Matrix ({split_name})")
 
-    # classification report (dict + print)
-    rep = classification_report(
-        all_y, all_p,
-        labels=[0, 1],
-        target_names=["bad", "good"],
-        output_dict=True,
-        zero_division=0
-    )
-    (OUTPUT_DIR / f"classification_report_{split_name}.json").write_text(
-        json.dumps(rep, indent=2), encoding="utf-8"
-    )
-
-    # ✅ מה שהיה חסר: הדפסה למסך כמו בתמונה
     rep_txt = classification_report(
         all_y, all_p,
         labels=[0, 1],
@@ -1262,35 +1267,32 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     )
     print(f"\n=== classification_report ({split_name}) ===\n{rep_txt}")
 
-    # אופציונלי: גם לשמור TXT קריא
-    (OUTPUT_DIR / f"classification_report_{split_name}.txt").write_text(rep_txt, encoding="utf-8")
-
-    # אופציונלי: להכניס F1 לסיכום (כדי שיופיע גם ב-README / prints)
-    f1_macro = float(rep["macro avg"]["f1-score"])
-    f1_weighted = float(rep["weighted avg"]["f1-score"])
-
-
     plot_performance_metrics(df, split_name)
+
+    rep = classification_report(
+        all_y, all_p,
+        labels=[0, 1],
+        target_names=["bad", "good"],
+        output_dict=True,
+        zero_division=0
+    )
 
     summary = {
         "split": split_name,
         "n": int(len(df)),
         "accuracy": float(df["correct"].mean() if len(df) else 0.0),
         "confusion_matrix": cm.tolist(),
-        
+        "f1_bad": float(rep["bad"]["f1-score"]),
+        "f1_good": float(rep["good"]["f1-score"]),
+        "f1_macro": float(rep["macro avg"]["f1-score"]),
+        "f1_weighted": float(rep["weighted avg"]["f1-score"]),
     }
-    summary.update({
-    "f1_bad": float(rep["bad"]["f1-score"]),
-    "f1_good": float(rep["good"]["f1-score"]),
-    "f1_macro": float(rep["macro avg"]["f1-score"]),
-    "f1_weighted": float(rep["weighted avg"]["f1-score"]),
-    })
 
-    print(f"\n[{split_name}] accuracy={summary['accuracy']:.4f}")
+    print(f"\n[{split_name}] accuracy={summary['accuracy']:.4f} | f1_macro={summary['f1_macro']:.4f} | f1_weighted={summary['f1_weighted']:.4f}")
     return df, summary
 
 # ============================================================
-# 12) README + Zip artifact
+# 11) README (minimal)
 # ============================================================
 def write_readme(summaries: List[Dict], note: str = ""):
     lines = []
@@ -1298,6 +1300,7 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append("## Project structure (required by instructor)\n")
     lines.append("- Part 1: Synthetic data generation using 3D pose extraction + 3D pose manipulation + ControlNet Img2Img\n")
     lines.append("- Part 2: Fine-tune a pretrained ViT image model to classify Good vs Bad squats using synthetic data\n")
+
     lines.append("\n## Config\n")
     lines.append(f"- Device: {DEVICE}\n")
     lines.append(f"- TOTAL_IMAGES: {cfg.TOTAL_IMAGES}\n")
@@ -1310,10 +1313,11 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append(f"- LABEL_SMOOTHING: {cfg.LABEL_SMOOTHING}\n")
 
     lines.append("\n## Outputs\n")
-    lines.append("- outputs/eda_counts.csv + outputs/eda_class_counts.png\n")
-    lines.append("- outputs/*_predictions.csv + confusion_*.png + classification_report_*.json\n")
-    lines.append("- outputs/vit_squat_best.pth + outputs/vit_squat_last.pth + outputs/train_log.csv\n")
-    lines.append(f"- outputs/{cfg.ZIP_NAME}\n")
+    lines.append("- outputs/val_predictions.csv\n")
+    lines.append("- outputs/confidence_dist_val.png\n")
+    lines.append("- outputs/confusion_val.png\n")
+    lines.append("- outputs/roc_curve_val.png\n")
+    lines.append("- outputs/README.md\n")
 
     if note.strip():
         lines.append("\n## Notes\n")
@@ -1323,44 +1327,15 @@ def write_readme(summaries: List[Dict], note: str = ""):
     for s in summaries:
         lines.append(f"### {s.get('split','?')}\n")
         lines.append(f"- n = {s.get('n',0)}\n")
-        if "accuracy" in s:
-            lines.append(f"- accuracy = {s.get('accuracy',0):.4f}\n")
+        lines.append(f"- accuracy = {s.get('accuracy',0):.4f}\n")
+        lines.append(f"- f1_macro = {s.get('f1_macro',0):.4f}\n")
+        lines.append(f"- f1_weighted = {s.get('f1_weighted',0):.4f}\n")
 
     (OUTPUT_DIR / "README.md").write_text("\n".join(lines), encoding="utf-8")
     print("README saved: outputs/README.md")
 
-def zip_artifact():
-    zip_path = OUTPUT_DIR / cfg.ZIP_NAME
-    if zip_path.exists():
-        zip_path.unlink()
-
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        if SYNTH_DIR.exists():
-            for p in SYNTH_DIR.rglob("*"):
-                if p.is_file():
-                    z.write(p, arcname=str(p.relative_to(ROOT)))
-        if OUTPUT_DIR.exists():
-            for p in OUTPUT_DIR.rglob("*"):
-                if p.is_file() and p.name != cfg.ZIP_NAME:
-                    z.write(p, arcname=str(p.relative_to(ROOT)))
-        try:
-            this_file = Path(__file__).resolve()
-            if this_file.exists():
-                z.write(this_file, arcname=str(this_file.relative_to(ROOT)))
-        except Exception:
-            pass
-
-    print(f"zip created: {zip_path}")
-
-    if _in_colab():
-        try:
-            from google.colab import files  # type: ignore
-            files.download(str(zip_path))
-        except Exception:
-            pass
-
 # ============================================================
-# 13) Main
+# 12) Main
 # ============================================================
 def main():
     print(f"ROOT: {ROOT}")
@@ -1370,7 +1345,6 @@ def main():
     if not GOOD_SEEDS_DIR.exists() or not list_images(GOOD_SEEDS_DIR):
         raise FileNotFoundError("❌ seeds/good is missing or empty. Put valid squat images into seeds/good")
 
-    # Stage 1 (required): generation
     enable_gen = os.environ.get("ENABLE_GENERATION", "0") == "1"
     auto_if_empty = os.environ.get("AUTO_GENERATE_IF_EMPTY", "1") == "1"
 
@@ -1382,7 +1356,6 @@ def main():
     else:
         print("⚠️ Generation skipped (ENABLE_GENERATION!=1 and dataset not empty). Using existing synthetic_dataset/")
 
-    # confirm data exists
     n_train = count_images(TRAIN_DIR/"good") + count_images(TRAIN_DIR/"bad")
     n_val   = count_images(VAL_DIR/"good") + count_images(VAL_DIR/"bad")
     if n_train == 0 or n_val == 0:
@@ -1390,10 +1363,7 @@ def main():
         print("👉 Tip: set ENABLE_GENERATION=1 to force generation (CUDA recommended).")
         return
 
-    # EDA
-    run_eda_counts()
-
-    # Stage 2 (required): training
+    # Train
     if os.environ.get("SKIP_TRAIN", "0") == "1":
         print("⚠️ SKIP_TRAIN=1 -> skipping training, trying to load outputs/vit_squat_best.pth")
         best_path = OUTPUT_DIR / "vit_squat_best.pth"
@@ -1412,31 +1382,26 @@ def main():
             print("❌ Training failed.")
             return
 
-    # Evaluation
     summaries: List[Dict] = []
     _, val_summary = evaluate_split(model, VAL_DIR, "val", transform)
     summaries.append(val_summary)
 
-    # (Optional) test
-    if cfg.TEST_RATIO > 0 and (count_images(TEST_DIR/"good") + count_images(TEST_DIR/"bad")) > 0:
-        _, test_summary = evaluate_split(model, TEST_DIR, "test", transform)
-        summaries.append(test_summary)
-
-    # Print final accuracy (requested)
     print("\n=== Final Accuracy ===")
     for s in summaries:
-        if "accuracy" in s:
-            print(f"{s['split']}: accuracy={s['accuracy']:.4f} (n={s.get('n', 0)})")
+        print(f"{s['split']}: accuracy={s['accuracy']:.4f} (n={s.get('n', 0)})")
 
     note = "Generation uses 3D pose extraction + 3D pose manipulation (dragging + rotations) + ControlNet Img2Img. Training uses ViT fine-tuning with cosine LR, label smoothing, optional mixup, early stopping."
     if train_info:
-        note += f"\nTrain artifacts: {train_info}"
+        note += f"\nTrain artifacts (created then pruned in minimal mode): {train_info}"
 
     write_readme(summaries, note=note)
-    print(f"{s['split']}: acc={s['accuracy']:.4f} | f1_macro={s.get('f1_macro',0):.4f} | f1_weighted={s.get('f1_weighted',0):.4f}")
 
-    if os.environ.get("SKIP_ZIP", "0") != "1":
-        zip_artifact()
+    for s in summaries:
+        print(f"{s['split']}: acc={s['accuracy']:.4f} | f1_macro={s.get('f1_macro',0):.4f} | f1_weighted={s.get('f1_weighted',0):.4f}")
+
+    # keep outputs minimal
+    if MINIMAL_OUTPUT:
+        prune_outputs_dir()
 
     print("\n✅ DONE. Check outputs/")
 
