@@ -6,20 +6,21 @@ import sys
 import json
 import time
 import math
-import shutil
 import zipfile
 import random
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report, f1_score
 
-# -----------------------
+
+# ============================================================
 # 0) Dependency setup (Colab-friendly, with REAL validation)
-# -----------------------
+# ============================================================
 def _in_colab() -> bool:
     try:
-        import google.colab  
+        import google.colab  # type: ignore
         return True
     except Exception:
         return False
@@ -54,26 +55,29 @@ def ensure_deps():
         "scikit-learn",
         "matplotlib",
         "tqdm",
+        "torch",
+        "torchvision",
     ]
 
     _maybe_fix_shadowing("mediapipe")
 
     try:
-        import mediapipe as mp  
+        import mediapipe as mp  # type: ignore
         ok_mp = hasattr(mp, "solutions")
         if not ok_mp:
             raise RuntimeError("mediapipe import exists but mp.solutions is missing (broken install or shadowed).")
-
-        import diffusers  
-        import transformers  
-        import accelerate  
-        import cv2  
-        import PIL  
-        import numpy 
-        import pandas
-        import sklearn  
-        import matplotlib  
-        import tqdm  
+        import diffusers  # type: ignore
+        import transformers  # type: ignore
+        import accelerate  # type: ignore
+        import cv2  # type: ignore
+        import PIL  # type: ignore
+        import numpy  # type: ignore
+        import pandas  # type: ignore
+        import sklearn  # type: ignore
+        import matplotlib  # type: ignore
+        import tqdm  # type: ignore
+        import torch  # type: ignore
+        import torchvision  # type: ignore
     except Exception as e:
         print("Installing/repairing dependencies...")
         print("Reason:", repr(e))
@@ -90,16 +94,17 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+
 from PIL import Image
 from tqdm import tqdm
 
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
-from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+
+from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
 
 from torchvision import models, transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from diffusers import ControlNetModel
 try:
@@ -108,23 +113,48 @@ except Exception:
     from diffusers.pipelines.controlnet import StableDiffusionControlNetImg2ImgPipeline  # type: ignore
 from diffusers import DPMSolverMultistepScheduler
 
+# ============================================================
+# 1) Config + ENV overrides
+# ============================================================
+def _env_int(name: str, default: int) -> int:
+    s = os.environ.get(name, "").strip()
+    return int(s) if s else default
 
-# -----------------------
-# 1) Config
-# -----------------------
+def _env_float(name: str, default: float) -> float:
+    s = os.environ.get(name, "").strip()
+    return float(s) if s else default
+
+def _env_str(name: str, default: str) -> str:
+    s = os.environ.get(name, "").strip()
+    return s if s else default
+
 @dataclass
 class CFG:
+    # generation
     TOTAL_IMAGES: int = 2000
-    BATCH_SIZE: int = 16
-    FINETUNE_EPOCHS: int = 4
-    UNFREEZE_LAST_BLOCKS: int = 4
-
     VAL_RATIO: float = 0.2
-    TEST_RATIO: float = 0.0 
+    TEST_RATIO: float = 0.0
     IMG_SIZE: int = 512
     CONTROL_SIZE: int = 512
     CANVAS_MARGIN: float = 0.08
 
+    # training
+    BATCH_SIZE: int = 16
+    WARMUP_EPOCHS: int = 1
+    FINETUNE_EPOCHS: int = 8
+    UNFREEZE_LAST_BLOCKS: int = 4
+
+    LR_WARMUP: float = 2e-4
+    LR_FINETUNE: float = 3e-5
+    WEIGHT_DECAY: float = 1e-4
+    LABEL_SMOOTHING: float = 0.05
+    GRAD_ACCUM_STEPS: int = 1
+    EARLY_STOP_PATIENCE: int = 3
+
+    # mixup (optional)
+    MIXUP_ALPHA: float = 0.0  # set env MIXUP_ALPHA=0.2 to enable
+
+    # stable diffusion
     SD_MODEL: str = "runwayml/stable-diffusion-v1-5"
     CONTROLNET_MODEL: str = "lllyasviel/sd-controlnet-openpose"
 
@@ -141,8 +171,8 @@ class CFG:
         "bad anatomy, bad proportions, distorted face, watermark, text, logo"
     )
 
-    IMG2IMG_STRENGTH_GOOD: float = 0.75
-    IMG2IMG_STRENGTH_BAD: float = 0.80
+    IMG2IMG_STRENGTH_GOOD: float = 0.65
+    IMG2IMG_STRENGTH_BAD: float = 0.75
 
     NUM_STEPS: int = 20
     GUIDANCE_SCALE: float = 7.5
@@ -151,21 +181,27 @@ class CFG:
     SYNTH_BAD_FROM_BADSEEDS: bool = True
     BAD_FROM_BADSEEDS_FRACTION_TRAIN: float = 0.25
 
-    WARMUP_EPOCHS: int = 1
-    LR_WARMUP: float = 2e-4
-    LR_FINETUNE: float = 6e-5
-    WEIGHT_DECAY: float = 1e-4
-
     SEED: int = 42
-
     ZIP_NAME: str = "PoseAITraining_artifact.zip"
 
 cfg = CFG()
 
+# override from env (handy for experiments)
+cfg.TOTAL_IMAGES = _env_int("TOTAL_IMAGES", cfg.TOTAL_IMAGES)
+cfg.FINETUNE_EPOCHS = _env_int("FINETUNE_EPOCHS", cfg.FINETUNE_EPOCHS)
+cfg.WARMUP_EPOCHS = _env_int("WARMUP_EPOCHS", cfg.WARMUP_EPOCHS)
+cfg.UNFREEZE_LAST_BLOCKS = _env_int("UNFREEZE_LAST_BLOCKS", cfg.UNFREEZE_LAST_BLOCKS)
+cfg.BATCH_SIZE = _env_int("BATCH_SIZE", cfg.BATCH_SIZE)
+cfg.LR_WARMUP = _env_float("LR_WARMUP", cfg.LR_WARMUP)
+cfg.LR_FINETUNE = _env_float("LR_FINETUNE", cfg.LR_FINETUNE)
+cfg.LABEL_SMOOTHING = _env_float("LABEL_SMOOTHING", cfg.LABEL_SMOOTHING)
+cfg.GRAD_ACCUM_STEPS = max(1, _env_int("GRAD_ACCUM_STEPS", cfg.GRAD_ACCUM_STEPS))
+cfg.MIXUP_ALPHA = _env_float("MIXUP_ALPHA", cfg.MIXUP_ALPHA)
+cfg.EARLY_STOP_PATIENCE = _env_int("EARLY_STOP_PATIENCE", cfg.EARLY_STOP_PATIENCE)
 
-# -----------------------
+# ============================================================
 # 2) Paths
-# -----------------------
+# ============================================================
 ROOT = Path(".").resolve()
 
 SEEDS_DIR = ROOT / "seeds"
@@ -191,10 +227,9 @@ for d in [
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-
-# -----------------------
+# ============================================================
 # 3) Utilities
-# -----------------------
+# ============================================================
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -205,10 +240,13 @@ def seed_everything(seed: int):
 seed_everything(cfg.SEED)
 
 def list_images(p: Path) -> List[Path]:
-    exts = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    if not p.exists():
+        return []
     out: List[Path] = []
-    for e in exts:
-        out += list(p.glob(e))
+    for q in p.iterdir():
+        if q.is_file() and q.suffix.lower() in exts:
+            out.append(q)
     return sorted(out)
 
 def safe_imread_pil(path: Path) -> Image.Image:
@@ -231,10 +269,13 @@ def count_images(dirp: Path) -> int:
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
+def num_workers_auto() -> int:
+    # windows tends to be fragile with >0 without guard
+    return 0 if os.name == "nt" else 2
 
-# -----------------------
+# ============================================================
 # 4) MediaPipe 3D pose extraction
-# -----------------------
+# ============================================================
 mp_pose = mp.solutions.pose
 
 def extract_world_landmarks_from_image(pil_img: Image.Image) -> Optional[landmark_pb2.LandmarkList]:
@@ -247,10 +288,9 @@ def _lm_vec(lms, idx: int) -> np.ndarray:
     lm = lms[idx]
     return np.array([lm.x, lm.y, lm.z], dtype=np.float32)
 
-
-# -----------------------
-# 5) Tree skeleton + FK
-# -----------------------
+# ============================================================
+# 5) Skeleton tree + FK + 3D dragging (improves realism/diversity)
+# ============================================================
 class SkeletonNode:
     def __init__(self, name: str, parent: Optional["SkeletonNode"]=None, landmark_idx: Optional[int]=None):
         self.name = name
@@ -262,7 +302,12 @@ class SkeletonNode:
         if parent is not None:
             parent.children.append(self)
 
-def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, SkeletonNode]]:
+def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, SkeletonNode], Dict[int, np.ndarray]]:
+    """
+    Returns:
+      root + node_map for manipulatable joints,
+      base_pts: all 33 pose landmark points centered at mid-hip (for a full control map).
+    """
     lms = world_landmarks.landmark
 
     LH = mp_pose.PoseLandmark.LEFT_HIP.value
@@ -273,8 +318,13 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
     mid_hip = (_lm_vec(lms, LH) + _lm_vec(lms, RH)) / 2.0
     mid_shoulder = (_lm_vec(lms, LS) + _lm_vec(lms, RS)) / 2.0
 
+    # full 3D points (centered) for all landmarks (important for a richer control skeleton)
+    base_pts: Dict[int, np.ndarray] = {}
+    for i in range(len(lms)):
+        base_pts[i] = (_lm_vec(lms, i) - mid_hip).astype(np.float32)
+
     def get_centered(idx: int) -> np.ndarray:
-        return _lm_vec(lms, idx) - mid_hip
+        return base_pts[idx]
 
     root = SkeletonNode("MID_HIP", None, None)
     root.world_pos = np.zeros(3, dtype=np.float32)
@@ -284,6 +334,7 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
 
     node_map: Dict[str, SkeletonNode] = {"MID_HIP": root, "MID_SHOULDER": spine}
 
+    # legs
     l_hip = SkeletonNode("LEFT_HIP", root, LH);  l_hip.world_pos = get_centered(LH)
     l_knee = SkeletonNode("LEFT_KNEE", l_hip, mp_pose.PoseLandmark.LEFT_KNEE.value); l_knee.world_pos = get_centered(mp_pose.PoseLandmark.LEFT_KNEE.value)
     l_ankle = SkeletonNode("LEFT_ANKLE", l_knee, mp_pose.PoseLandmark.LEFT_ANKLE.value); l_ankle.world_pos = get_centered(mp_pose.PoseLandmark.LEFT_ANKLE.value)
@@ -292,6 +343,7 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
     r_knee = SkeletonNode("RIGHT_KNEE", r_hip, mp_pose.PoseLandmark.RIGHT_KNEE.value); r_knee.world_pos = get_centered(mp_pose.PoseLandmark.RIGHT_KNEE.value)
     r_ankle = SkeletonNode("RIGHT_ANKLE", r_knee, mp_pose.PoseLandmark.RIGHT_ANKLE.value); r_ankle.world_pos = get_centered(mp_pose.PoseLandmark.RIGHT_ANKLE.value)
 
+    # arms
     l_sh = SkeletonNode("LEFT_SHOULDER", spine, LS); l_sh.world_pos = get_centered(LS)
     r_sh = SkeletonNode("RIGHT_SHOULDER", spine, RS); r_sh.world_pos = get_centered(RS)
     l_el = SkeletonNode("LEFT_ELBOW", l_sh, mp_pose.PoseLandmark.LEFT_ELBOW.value); l_el.world_pos = get_centered(mp_pose.PoseLandmark.LEFT_ELBOW.value)
@@ -314,37 +366,21 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
             update_world(ch)
     update_world(root)
 
-    return root, node_map
+    return root, node_map, base_pts
 
-def clone_skeleton(root: SkeletonNode) -> Tuple[SkeletonNode, Dict[str, SkeletonNode]]:
+def clone_skeleton(root: SkeletonNode, base_pts: Dict[int, np.ndarray]) -> Tuple[SkeletonNode, Dict[str, SkeletonNode], Dict[int, np.ndarray]]:
     node_map: Dict[str, SkeletonNode] = {}
     def _clone(node: SkeletonNode, parent: Optional[SkeletonNode]) -> SkeletonNode:
-        nn = SkeletonNode(node.name, parent, node.landmark_idx)
-        nn.local_pos = node.local_pos.copy()
-        nn.world_pos = node.world_pos.copy()
-        node_map[nn.name] = nn
+        nn_ = SkeletonNode(node.name, parent, node.landmark_idx)
+        nn_.local_pos = node.local_pos.copy()
+        nn_.world_pos = node.world_pos.copy()
+        node_map[nn_.name] = nn_
         for ch in node.children:
-            _clone(ch, nn)
-        return nn
+            _clone(ch, nn_)
+        return nn_
     new_root = _clone(root, None)
-    return new_root, node_map
-
-def rot_x(deg: float) -> np.ndarray:
-    a = math.radians(deg)
-    return np.array([[1,0,0],[0, math.cos(a), -math.sin(a)],[0, math.sin(a), math.cos(a)]], dtype=np.float32)
-
-def rot_y(deg: float) -> np.ndarray:
-    a = math.radians(deg)
-    return np.array([[math.cos(a),0, math.sin(a)],[0,1,0],[-math.sin(a),0, math.cos(a)]], dtype=np.float32)
-
-def rot_z(deg: float) -> np.ndarray:
-    a = math.radians(deg)
-    return np.array([[math.cos(a), -math.sin(a),0],[math.sin(a), math.cos(a),0],[0,0,1]], dtype=np.float32)
-
-def apply_rotation_to_subtree(joint: SkeletonNode, R: np.ndarray):
-    for ch in joint.children:
-        ch.local_pos = (R @ ch.local_pos).astype(np.float32)
-        apply_rotation_to_subtree(ch, R)
+    new_base = {k: v.copy() for k, v in base_pts.items()}
+    return new_root, node_map, new_base
 
 def update_world_positions(root: SkeletonNode):
     def _upd(node: SkeletonNode):
@@ -363,77 +399,137 @@ def skeleton_to_landmark_dict(root: SkeletonNode) -> Dict[int, np.ndarray]:
     _walk(root)
     return out
 
-def make_bad_pose_fk(root: SkeletonNode, node_map: Dict[str, SkeletonNode]):
-    # FK-only realistic bad variety
+def merge_points(base_pts: Dict[int, np.ndarray], overrides: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+    out = {k: v.copy() for k, v in base_pts.items()}
+    for k, v in overrides.items():
+        out[int(k)] = v.copy()
+    return out
+
+def rot_x(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    return np.array([[1,0,0],[0, math.cos(a), -math.sin(a)],[0, math.sin(a), math.cos(a)]], dtype=np.float32)
+
+def rot_y(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    return np.array([[math.cos(a),0, math.sin(a)],[0,1,0],[-math.sin(a),0, math.cos(a)]], dtype=np.float32)
+
+def rot_z(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    return np.array([[math.cos(a), -math.sin(a),0],[math.sin(a), math.cos(a),0],[0,0,1]], dtype=np.float32)
+
+def apply_rotation_to_subtree(joint: SkeletonNode, R: np.ndarray):
+    for ch in joint.children:
+        ch.local_pos = (R @ ch.local_pos).astype(np.float32)
+        apply_rotation_to_subtree(ch, R)
+
+def _norm(v: np.ndarray) -> float:
+    return float(np.linalg.norm(v) + 1e-8)
+
+def drag_joint_keep_bone_length(node: SkeletonNode, target_world: np.ndarray):
+    """
+    Simple IK-ish: keep bone length (|local|) but rotate direction so the node reaches target as close as possible.
+    Works well for 'drag knee inward', 'raise ankle', etc.
+    """
+    if node.parent is None:
+        return
+    parent = node.parent
+    L = _norm(node.local_pos)
+    dir_vec = (target_world - parent.world_pos).astype(np.float32)
+    d = _norm(dir_vec)
+    if d < 1e-6:
+        return
+    new_dir = (dir_vec / d).astype(np.float32)
+    node.local_pos = (new_dir * L).astype(np.float32)
+
+def make_good_pose_jitter(root: SkeletonNode, node_map: Dict[str, SkeletonNode]):
+    # small jitter improves diversity of "good" images without changing label
     def rng(a, b): return random.uniform(a, b)
-
-    faults = []
-    if random.random() < 0.90: faults.append("forward_lean")
-    if random.random() < 0.70: faults.append("knee_valgus")
-    if random.random() < 0.45: faults.append("knee_forward")
-    if random.random() < 0.40: faults.append("hip_shift")
-    if random.random() < 0.30: faults.append("torso_twist")
-    if random.random() < 0.30: faults.append("pelvic_tuck")
-
-    if "forward_lean" in faults and "MID_SHOULDER" in node_map:
-        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_x(rng(25, 50)))
-        if random.random() < 0.35:
-            apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_z(rng(-10, 10)))
-
-    if "torso_twist" in faults and "MID_SHOULDER" in node_map:
-        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_y(rng(-20, 20)))
-        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_z(rng(-12, 12)))
-
-    if "knee_valgus" in faults:
-        if "LEFT_KNEE" in node_map:
-            apply_rotation_to_subtree(node_map["LEFT_KNEE"], rot_z(rng(+12, +28)))
-        if "RIGHT_KNEE" in node_map:
-            apply_rotation_to_subtree(node_map["RIGHT_KNEE"], rot_z(rng(-12, -28)))
-        if random.random() < 0.40:
-            if "LEFT_HIP" in node_map:
-                apply_rotation_to_subtree(node_map["LEFT_HIP"], rot_y(rng(+6, +16)))
-            if "RIGHT_HIP" in node_map:
-                apply_rotation_to_subtree(node_map["RIGHT_HIP"], rot_y(rng(-6, -16)))
-
-    if "knee_forward" in faults:
-        sgn = 1.0 if random.random() < 0.5 else -1.0
-        if "LEFT_KNEE" in node_map:
-            apply_rotation_to_subtree(node_map["LEFT_KNEE"], rot_x(sgn * rng(10, 25)))
-        if "RIGHT_KNEE" in node_map:
-            apply_rotation_to_subtree(node_map["RIGHT_KNEE"], rot_x(sgn * rng(10, 25)))
-        if "MID_SHOULDER" in node_map and random.random() < 0.6:
-            apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_x(rng(8, 18)))
-
-    if "hip_shift" in faults:
-        shift_dir = 1.0 if random.random() < 0.5 else -1.0
-        if "LEFT_HIP" in node_map:
-            apply_rotation_to_subtree(node_map["LEFT_HIP"], rot_z(shift_dir * rng(6, 16)))
-        if "RIGHT_HIP" in node_map:
-            apply_rotation_to_subtree(node_map["RIGHT_HIP"], rot_z(-shift_dir * rng(6, 16)))
-        if "MID_SHOULDER" in node_map and random.random() < 0.7:
-            apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_z(-shift_dir * rng(4, 10)))
-
-    if "pelvic_tuck" in faults:
-        if "LEFT_HIP" in node_map:
-            apply_rotation_to_subtree(node_map["LEFT_HIP"], rot_x(rng(8, 22)))
-        if "RIGHT_HIP" in node_map:
-            apply_rotation_to_subtree(node_map["RIGHT_HIP"], rot_x(rng(8, 22)))
-        if "MID_SHOULDER" in node_map and random.random() < 0.8:
-            apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_x(rng(6, 16)))
-
+    if "MID_SHOULDER" in node_map and random.random() < 0.7:
+        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_y(rng(-6, 6)))
+    if "LEFT_HIP" in node_map and random.random() < 0.3:
+        apply_rotation_to_subtree(node_map["LEFT_HIP"], rot_z(rng(-4, 4)))
+    if "RIGHT_HIP" in node_map and random.random() < 0.3:
+        apply_rotation_to_subtree(node_map["RIGHT_HIP"], rot_z(rng(-4, 4)))
     update_world_positions(root)
 
+def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> List[str]:
+    """
+    Richer 'bad' generation: mix rotations + true 3D dragging (bone-length preserving).
+    Produces multiple plausible failure modes, improving training signal.
+    """
+    def rng(a, b): return random.uniform(a, b)
+    faults: List[str] = []
 
-# -----------------------
-# 6) Camera sampling + projection + OpenPose-like map
-# -----------------------
+    # Choose multiple faults per sample
+    if random.random() < 0.85: faults.append("forward_lean")
+    if random.random() < 0.75: faults.append("knee_valgus")
+    if random.random() < 0.50: faults.append("heel_lift")
+    if random.random() < 0.40: faults.append("hip_shift")
+    if random.random() < 0.35: faults.append("torso_twist")
+    if random.random() < 0.25: faults.append("depth_shallow")
+
+    # 1) forward lean: rotate torso around X (pitch)
+    if "forward_lean" in faults and "MID_SHOULDER" in node_map:
+        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_x(rng(20, 45)))
+
+    # 2) torso twist: yaw + small roll
+    if "torso_twist" in faults and "MID_SHOULDER" in node_map:
+        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_y(rng(-18, 18)))
+        apply_rotation_to_subtree(node_map["MID_SHOULDER"], rot_z(rng(-10, 10)))
+
+    # 3) knee valgus: DRAG knees toward midline (x -> 0)
+    if "knee_valgus" in faults:
+        for kn in ["LEFT_KNEE", "RIGHT_KNEE"]:
+            if kn in node_map:
+                k = node_map[kn]
+                # move x toward 0 (midline) and a bit forward/back
+                target = k.world_pos.copy()
+                target[0] *= rng(0.35, 0.65)  # collapse inward
+                target[2] += rng(-0.05, 0.05)
+                drag_joint_keep_bone_length(k, target)
+
+    # 4) heel lift: DRAG ankles upward (y) and slightly forward (z)
+    if "heel_lift" in faults:
+        for an in ["LEFT_ANKLE", "RIGHT_ANKLE"]:
+            if an in node_map:
+                a = node_map[an]
+                target = a.world_pos.copy()
+                target[1] += rng(0.08, 0.18)
+                target[2] += rng(-0.05, 0.10)
+                drag_joint_keep_bone_length(a, target)
+
+    # 5) hip shift: shift pelvis lateral (simulate asymmetry)
+    if "hip_shift" in faults:
+        shift = rng(-0.12, 0.12)
+        for hn in ["LEFT_HIP", "RIGHT_HIP"]:
+            if hn in node_map:
+                h = node_map[hn]
+                target = h.world_pos.copy()
+                target[0] += shift * (1.0 if hn == "LEFT_HIP" else -1.0)
+                drag_joint_keep_bone_length(h, target)
+
+    # 6) shallow depth: reduce knee flexion by dragging knees upward a bit
+    if "depth_shallow" in faults:
+        for kn in ["LEFT_KNEE", "RIGHT_KNEE"]:
+            if kn in node_map:
+                k = node_map[kn]
+                target = k.world_pos.copy()
+                target[1] += rng(0.05, 0.12)
+                drag_joint_keep_bone_length(k, target)
+
+    update_world_positions(root)
+    return faults
+
+# ============================================================
+# 6) Camera sampling + projection + OpenPose-like control map
+# ============================================================
 def sample_camera_params() -> Dict[str, float]:
     return {
-        "yaw": random.uniform(-45, 45),
-        "pitch": random.uniform(-12, 12),
-        "roll": random.uniform(-6, 6),
-        "distance": random.uniform(3.0, 5.0),
-        "fov": random.uniform(30, 50),
+        "yaw": random.uniform(-50, 50),
+        "pitch": random.uniform(-15, 15),
+        "roll": random.uniform(-8, 8),
+        "distance": random.uniform(3.0, 5.5),
+        "fov": random.uniform(28, 55),
     }
 
 def project_3d_to_2d(points_3d: Dict[int, np.ndarray], cam: Dict[str, float],
@@ -489,13 +585,12 @@ def draw_openpose_like(projected: Dict[int, Dict[str, float]], width: int, heigh
             cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 4)
     for _, p in projected.items():
         x, y = int(p["x"] * width), int(p["y"] * height)
-        cv2.circle(canvas, (x, y), 6, (0, 0, 255), -1)
+        cv2.circle(canvas, (x, y), 5, (0, 0, 255), -1)
     return Image.fromarray(canvas)
 
-
-# -----------------------
+# ============================================================
 # 7) Stage 1: SD Img2Img + ControlNet generation
-# -----------------------
+# ============================================================
 def load_pipe() -> StableDiffusionControlNetImg2ImgPipeline:
     if DEVICE == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -551,7 +646,12 @@ def plan_targets(total_images: int) -> Dict[str, Dict[str, int]]:
     }
 
 def generate_synthetic_dataset(total_images: int):
-    print(f"\n=== Stage 1: Synthetic dataset (SD Img2Img + ControlNet) on {DEVICE} ===")
+    print(f"\n=== Stage 1: Synthetic dataset (3D pose → manipulate → ControlNet Img2Img) on {DEVICE} ===")
+
+    # diffusion on cpu is painfully slow; keep explicit
+    if DEVICE != "cuda" and os.environ.get("ALLOW_CPU_GENERATION", "0") != "1":
+        print("❌ Generation requires CUDA by default. Set ALLOW_CPU_GENERATION=1 to force CPU (slow).")
+        return
 
     good_seeds = list_images(GOOD_SEEDS_DIR)
     bad_seeds = list_images(BAD_SEEDS_DIR)
@@ -567,12 +667,6 @@ def generate_synthetic_dataset(total_images: int):
     val_good_seeds = good_seeds[-n_val:] if n_val > 0 else []
     train_good_seeds = good_seeds[:-n_val] if n_val > 0 else good_seeds[:]
 
-    test_good_seeds: List[Path] = []
-    if cfg.TEST_RATIO > 0 and len(train_good_seeds) >= 3:
-        n_test = max(1, int(round(n_good * cfg.TEST_RATIO)))
-        test_good_seeds = train_good_seeds[:n_test]
-        train_good_seeds = train_good_seeds[n_test:]
-
     targets = plan_targets(total_images)
 
     existing = {
@@ -586,9 +680,10 @@ def generate_synthetic_dataset(total_images: int):
 
     pipe = load_pipe()
 
-    pose_cache: Dict[str, Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image]] = {}
+    # cache per seed: (root,node_map,init_img,base_pts)
+    pose_cache: Dict[str, Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image, Dict[int, np.ndarray]]] = {}
 
-    def get_pose_and_init(seed_path: Path) -> Optional[Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image]]:
+    def get_pose_and_init(seed_path: Path) -> Optional[Tuple[SkeletonNode, Dict[str, SkeletonNode], Image.Image, Dict[int, np.ndarray]]]:
         key = str(seed_path.resolve())
         if key in pose_cache:
             return pose_cache[key]
@@ -596,23 +691,42 @@ def generate_synthetic_dataset(total_images: int):
         wlms = extract_world_landmarks_from_image(init_img)
         if wlms is None:
             return None
-        root, node_map = build_skeleton_tree(wlms)
-        pose_cache[key] = (root, node_map, init_img)
+        root, node_map, base_pts = build_skeleton_tree(wlms)
+        pose_cache[key] = (root, node_map, init_img, base_pts)
         return pose_cache[key]
 
-    def gen_one(split: str, label: str, seed_path: Path, source: str):
+    def rr(seeds: List[Path]):
+        i = 0
+        while True:
+            yield seeds[i % len(seeds)] if seeds else None
+            i += 1
+
+    rr_train_good = rr(train_good_seeds)
+    rr_val_good   = rr(val_good_seeds if val_good_seeds else train_good_seeds)
+    rr_bad        = rr(bad_seeds)
+
+    def gen_one(split: str, label: str, seed_path: Path, source: str) -> bool:
         pack = get_pose_and_init(seed_path)
         if pack is None:
             return False
 
-        root_rest, _node_map_rest, init_img = pack
+        root_rest, _node_map_rest, init_img, base_pts_rest = pack
         cam = sample_camera_params()
 
-        root, node_map = clone_skeleton(root_rest)
-        if label == "bad" and source == "bad_from_good":
-            make_bad_pose_fk(root, node_map)
+        root, node_map, base_pts = clone_skeleton(root_rest, base_pts_rest)
 
-        pts3d = skeleton_to_landmark_dict(root)
+        faults: List[str] = []
+        if label == "good":
+            # jitter "good" to increase diversity
+            if random.random() < 0.7:
+                make_good_pose_jitter(root, node_map)
+        else:
+            if source == "bad_from_good":
+                faults = make_bad_pose_3d(root, node_map)
+
+        overrides = skeleton_to_landmark_dict(root)
+        pts3d = merge_points(base_pts, overrides)
+
         proj = project_3d_to_2d(pts3d, cam, cfg.CONTROL_SIZE, cfg.CONTROL_SIZE, cfg.CANVAS_MARGIN)
         ctrl_img = draw_openpose_like(proj, cfg.CONTROL_SIZE, cfg.CONTROL_SIZE)
 
@@ -626,7 +740,16 @@ def generate_synthetic_dataset(total_images: int):
         g = torch.Generator(device=DEVICE)
         g.manual_seed(random.randint(0, 10**9))
 
-        with torch.autocast(device_type="cuda", dtype=TORCH_DTYPE) if DEVICE == "cuda" else torch.no_grad():
+        if DEVICE == "cuda":
+            ctx = torch.autocast(device_type="cuda", dtype=TORCH_DTYPE)
+        else:
+            # no autocast on cpu
+            class _NoCtx:
+                def __enter__(self): return None
+                def __exit__(self, exc_type, exc, tb): return False
+            ctx = _NoCtx()
+
+        with ctx:
             out = pipe(
                 prompt=prompt,
                 negative_prompt=cfg.NEGATIVE_PROMPT,
@@ -639,22 +762,37 @@ def generate_synthetic_dataset(total_images: int):
                 generator=g
             ).images[0]
 
-        fname = f"synth_{label}_{source}_{seed_path.stem}_{now_id()}.jpg"
+        fault_tag = ("__" + "__".join(faults[:3])) if faults else ""
+        fname = f"synth_{label}_{source}{fault_tag}_{seed_path.stem}_{now_id()}.jpg"
         out_path = SYNTH_DIR / split / label / fname
         _save_image(out, out_path)
+
+        # save metadata per image (useful for report)
+        meta = {
+            "label": label,
+            "source": source,
+            "faults": faults,
+            "seed": str(seed_path.name),
+            "camera": cam,
+            "prompt": prompt,
+        }
+        (out_path.with_suffix(".json")).write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return True
 
-    def rr(seeds: List[Path]):
-        i = 0
-        while True:
-            yield seeds[i % len(seeds)] if seeds else None
-            i += 1
+    def fill_split(split: str, label: str, target: int, seed_stream, source: str):
+        while count_images(SYNTH_DIR / split / label) < target:
+            seed_path = next(seed_stream)
+            if seed_path is None:
+                break
+            ok = gen_one(split, label, seed_path, source=source)
+            if not ok:
+                continue
 
-    rr_train_good = rr(train_good_seeds)
-    rr_val_good   = rr(val_good_seeds if val_good_seeds else train_good_seeds)
-    rr_test_good  = rr(test_good_seeds if test_good_seeds else (val_good_seeds if val_good_seeds else train_good_seeds))
-    rr_bad        = rr(bad_seeds)
+    # Good: from good seeds
+    fill_split("train", "good", targets["train"]["good"], rr_train_good, source="good_from_goodseeds")
+    fill_split("val",   "good", targets["val"]["good"],   rr_val_good,   source="good_from_goodseeds")
 
+    # Bad: mostly from manipulated good seeds, plus optional from bad seeds
     train_bad_target = targets["train"]["bad"]
     train_bad_from_badseeds = 0
     if cfg.SYNTH_BAD_FROM_BADSEEDS and bad_seeds and train_bad_target > 0:
@@ -662,71 +800,33 @@ def generate_synthetic_dataset(total_images: int):
         train_bad_from_badseeds = max(0, min(train_bad_from_badseeds, train_bad_target))
     train_bad_from_good = train_bad_target - train_bad_from_badseeds
 
-    def fill_split(split: str, good_target: int, bad_from_good_target: int):
-        while existing[split]["good"] < good_target:
-            seed_path = next(rr_train_good if split == "train" else rr_val_good if split == "val" else rr_test_good)
-            if seed_path is None:
-                break
-            ok = gen_one(split, "good", seed_path, source="good_from_goodseeds")
-            if ok:
-                existing[split]["good"] += 1
+    fill_split("train", "bad", train_bad_from_good, rr_train_good, source="bad_from_good")
+    fill_split("val",   "bad", targets["val"]["bad"],     rr_val_good,   source="bad_from_good")
 
-        while existing[split]["bad"] < bad_from_good_target:
-            seed_path = next(rr_train_good if split == "train" else rr_val_good if split == "val" else rr_test_good)
-            if seed_path is None:
-                break
-            ok = gen_one(split, "bad", seed_path, source="bad_from_good")
-            if ok:
-                existing[split]["bad"] += 1
-
-    fill_split("train", targets["train"]["good"], train_bad_from_good)
-
-    while existing["train"]["bad"] < targets["train"]["bad"] and train_bad_from_badseeds > 0:
-        seed_path = next(rr_bad)
-        if seed_path is None:
-            break
-        ok = gen_one("train", "bad", seed_path, source="extra_bad_from_badseeds")
-        if ok:
-            existing["train"]["bad"] += 1
-            train_bad_from_badseeds -= 1
-
-    fill_split("val", targets["val"]["good"], targets["val"]["bad"])
-    fill_split("test", targets["test"]["good"], targets["test"]["bad"])
+    if train_bad_from_badseeds > 0:
+        fill_split("train", "bad", train_bad_target, rr_bad, source="extra_bad_from_badseeds")
 
     print("\n✅ Generation complete. Final counts:", {
         sp: {"good": count_images(SYNTH_DIR/sp/"good"), "bad": count_images(SYNTH_DIR/sp/"bad")}
         for sp in ["train", "val", "test"]
     })
 
-
-# -----------------------
-# 8) EDA (expanded) — NO sample montages
-# -----------------------
-def _parse_source_from_name(name: str) -> str:
-    m = re.match(r"synth_(good|bad)_([A-Za-z0-9_]+)_", name)
-    return m.group(2) if m else "unknown"
-
-def _image_stats_one(path: Path) -> Dict[str, float]:
-    img = safe_imread_pil(path)
-    arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    brightness = float(gray.mean())
-    contrast = float(gray.std())
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    size_kb = float(path.stat().st_size / 1024.0)
-    return {"brightness": brightness, "contrast": contrast, "sharpness": sharpness, "size_kb": size_kb}
-
-def run_eda(max_per_bucket: int = 250):
-    print("\n=== EDA (focused) ===")
-
-    counts = []
+# ============================================================
+# 8) Lightweight EDA (counts + class balance)
+# ============================================================
+def run_eda_counts():
+    rows = []
     for split in ["train", "val", "test"]:
         for label in ["good", "bad"]:
-            paths = list_images(SYNTH_DIR / split / label)
-            counts.append({"split": split, "label": label, "count": len(paths)})
-    counts_df = pd.DataFrame(counts)
+            rows.append({
+                "split": split,
+                "label": label,
+                "count": count_images(SYNTH_DIR / split / label),
+            })
+    df = pd.DataFrame(rows)
+    df.to_csv(OUTPUT_DIR / "eda_counts.csv", index=False)
 
-    pivot = counts_df.pivot(index="split", columns="label", values="count").fillna(0)
+    pivot = df.pivot(index="split", columns="label", values="count").fillna(0)
     ax = pivot.plot(kind="bar")
     ax.set_title("Class counts per split")
     ax.set_xlabel("Split")
@@ -736,65 +836,11 @@ def run_eda(max_per_bucket: int = 250):
     fig.savefig(OUTPUT_DIR / "eda_class_counts.png", dpi=150)
     plt.close(fig)
 
-    counts_df.to_csv(OUTPUT_DIR / "eda_counts.csv", index=False)
+    print("✅ EDA saved: outputs/eda_counts.csv + outputs/eda_class_counts.png")
 
-    src_rows = []
-    for split in ["train", "val", "test"]:
-        for label in ["good", "bad"]:
-            for p in list_images(SYNTH_DIR / split / label):
-                src_rows.append({"split": split, "label": label, "source": _parse_source_from_name(p.name)})
-    src_df = pd.DataFrame(src_rows) if src_rows else pd.DataFrame(columns=["split","label","source"])
-    if not src_df.empty:
-        src_pivot = src_df.groupby(["split","label","source"]).size().reset_index(name="count")
-        src_pivot.to_json(OUTPUT_DIR / "eda_source_counts.json", orient="records", indent=2)
-        src_pivot.to_csv(OUTPUT_DIR / "eda_source_counts.csv", index=False)
-
-    stats_rows = []
-    for split in ["train", "val", "test"]:
-        for label in ["good", "bad"]:
-            paths = list_images(SYNTH_DIR / split / label)
-            if not paths:
-                continue
-            take = paths[:max_per_bucket]
-            for p in take:
-                st = _image_stats_one(p)
-                st.update({"split": split, "label": label})
-                stats_rows.append(st)
-
-    stats_df = pd.DataFrame(stats_rows) if stats_rows else pd.DataFrame()
-    if not stats_df.empty:
-        # Removed sharpness histogram to focus on model success metrics instead
-        pass
-
-        summary = (
-            stats_df.groupby(["split","label"])[["brightness","contrast","sharpness","size_kb"]]
-            .agg(["mean","std","min","max"])
-            .reset_index()
-        )
-        summary_records = []
-        for _, row in summary.iterrows():
-            rec = {"split": row[("split","")], "label": row[("label","")]}
-            for metric in ["brightness","contrast","sharpness","size_kb"]:
-                rec[f"{metric}_mean"] = float(row[(metric,"mean")])
-                rec[f"{metric}_std"]  = float(row[(metric,"std")])
-                rec[f"{metric}_min"]  = float(row[(metric,"min")])
-                rec[f"{metric}_max"]  = float(row[(metric,"max")])
-            summary_records.append(rec)
-        (OUTPUT_DIR / "eda_stats_summary.json").write_text(json.dumps(summary_records, indent=2), encoding="utf-8")
-    print("✅ EDA saved: outputs/eda_class_counts.png")
-
-    report = {
-        "device": DEVICE,
-        "counts": counts,
-        "notes": "No sample montages. EDA data saved as CSV and JSON.",
-    }
-    (OUTPUT_DIR / "eda_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print("✅ EDA saved: outputs/eda_*.png + outputs/eda_*json + outputs/eda_*.csv")
-
-
-# -----------------------
-# 9) Stage 2: ViT training (improved)
-# -----------------------
+# ============================================================
+# 9) Dataset & Transforms (improved for generalization)
+# ============================================================
 class SquatDataset(Dataset):
     def __init__(self, root_dir: Path, transform=None):
         self.root_dir = Path(root_dir)
@@ -819,11 +865,11 @@ def _make_transforms():
     mean = weights.meta.get("mean", (0.485, 0.456, 0.406))
     std  = weights.meta.get("std",  (0.229, 0.224, 0.225))
 
-
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.75, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.70, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+        transforms.ColorJitter(brightness=0.18, contrast=0.18, saturation=0.12, hue=0.03),
+        transforms.RandomGrayscale(p=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
@@ -836,9 +882,14 @@ def _make_transforms():
     ])
     return train_tf, eval_tf
 
+# ============================================================
+# 10) Training (better schedule + early stopping + optional mixup)
+# ============================================================
 def _unfreeze_last_blocks(model: nn.Module, n_blocks: int):
+    # freeze all
     for p in model.parameters():
         p.requires_grad = False
+    # unfreeze head
     for p in model.heads.parameters():
         p.requires_grad = True
 
@@ -856,96 +907,233 @@ def _accuracy_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
     pred = torch.argmax(logits, dim=1)
     return float((pred == y).float().mean().item())
 
-def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose]]:
-    print("\n=== Stage 2: Train image model (ViT-B/16) — improved ===")
+def _soft_cross_entropy(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+    # target_probs: (B, C) probabilities
+    logp = torch.log_softmax(logits, dim=1)
+    return -(target_probs * logp).sum(dim=1).mean()
+
+def _mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    # y is class indices => return soft labels
+    if alpha <= 0:
+        # convert to one-hot anyway
+        y_oh = torch.zeros((y.size(0), 2), device=y.device, dtype=torch.float32)
+        y_oh.scatter_(1, y.view(-1, 1), 1.0)
+        return x, y_oh
+
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    x2 = x[idx]
+    y2 = y[idx]
+
+    x_mix = lam * x + (1 - lam) * x2
+    y_oh = torch.zeros((y.size(0), 2), device=y.device, dtype=torch.float32)
+    y_oh.scatter_(1, y.view(-1, 1), 1.0)
+    y2_oh = torch.zeros((y2.size(0), 2), device=y.device, dtype=torch.float32)
+    y2_oh.scatter_(1, y2.view(-1, 1), 1.0)
+
+    y_mix = lam * y_oh + (1 - lam) * y2_oh
+    return x_mix, y_mix
+
+def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict[str, Any]]:
+    print("\n=== Stage 2: Train ViT-B/16 on synthetic data (improved) ===")
 
     train_tf, eval_tf = _make_transforms()
 
     train_ds = SquatDataset(TRAIN_DIR, transform=train_tf)
-    val_ds = SquatDataset(VAL_DIR, transform=eval_tf)
+    val_ds   = SquatDataset(VAL_DIR, transform=eval_tf)
 
-    if len(train_ds) == 0:
-        print("No training data found in synthetic_dataset/train.")
-        return None, None
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        print("❌ Missing training/val data in synthetic_dataset/.")
+        return None, None, {}
+
+    # class weights (even if balanced, keeps stable if mismatch)
+    ys = [y for _, y in train_ds.samples]
+    n0 = max(1, sum(1 for y in ys if y == 0))
+    n1 = max(1, sum(1 for y in ys if y == 1))
+    w0 = 1.0 / n0
+    w1 = 1.0 / n1
+    sample_w = [w0 if y == 0 else w1 for y in ys]
+    sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
 
     model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-    num_f = model.heads.head.in_features
-    model.heads.head = nn.Linear(num_f, 2)
+    model.heads.head = nn.Linear(model.heads.head.in_features, 2)
     model.to(DEVICE)
 
+    # warmup: head only
     _unfreeze_last_blocks(model, n_blocks=0)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                                  lr=cfg.LR_WARMUP, weight_decay=cfg.WEIGHT_DECAY)
-    criterion = nn.CrossEntropyLoss()
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, num_workers=2)
-    val_loader   = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=2)
+    num_workers = num_workers_auto()
+    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, sampler=sampler, num_workers=num_workers)
+    val_loader   = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=num_workers)
+
+    best_path = OUTPUT_DIR / "vit_squat_best.pth"
+    last_path = OUTPUT_DIR / "vit_squat_last.pth"
+    log_path  = OUTPUT_DIR / "train_log.csv"
+
+    # optimizer
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.LR_WARMUP,
+        weight_decay=cfg.WEIGHT_DECAY
+    )
+
+    # criterion: label smoothing for hard labels (when mixup off)
+    ce = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
 
-    best_val_acc = -1.0
-    best_path = OUTPUT_DIR / "vit_squat_best.pth"
+    # simple cosine schedule (per epoch) – warmup uses LR_WARMUP, finetune uses LR_FINETUNE
+    def set_lr(lr: float):
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
 
-    def run_epoch(train: bool) -> float:
-        loader = train_loader if train else val_loader
-        model.train(train)
-        accs = []
+    def eval_val() -> Tuple[float, float]:
+        model.eval()
         losses = []
-        for x, y, _ in loader:
+        accs = []
+        with torch.no_grad():
+            for x, y, _ in val_loader:
+                x = x.to(DEVICE)
+                y = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
+                logits = model(x)
+                loss = ce(logits, y)
+                losses.append(float(loss.item()))
+                accs.append(_accuracy_from_logits(logits, y))
+        return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
+
+    history_rows = []
+    best_val_acc = -1.0
+    no_improve = 0
+
+    # ---- Warmup ----
+    for epoch in range(cfg.WARMUP_EPOCHS):
+        model.train()
+        set_lr(cfg.LR_WARMUP)
+
+        running_loss = 0.0
+        running_acc = 0.0
+        n_batches = 0
+
+        optimizer.zero_grad(set_to_none=True)
+        for step, (x, y, _) in enumerate(train_loader):
             x = x.to(DEVICE)
-            y = torch.tensor(y, device=DEVICE) if not torch.is_tensor(y) else y.to(DEVICE)
+            y = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
 
             with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
                 logits = model(x)
-                loss = criterion(logits, y)
+                loss = ce(logits, y) / cfg.GRAD_ACCUM_STEPS
 
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
+
+            if (step + 1) % cfg.GRAD_ACCUM_STEPS == 0:
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            losses.append(float(loss.item()))
-            accs.append(_accuracy_from_logits(logits.detach(), y))
-        mean_loss = float(np.mean(losses)) if losses else 0.0
-        mean_acc  = float(np.mean(accs)) if accs else 0.0
-        return mean_loss, mean_acc
+            running_loss += float(loss.item()) * cfg.GRAD_ACCUM_STEPS
+            running_acc += _accuracy_from_logits(logits.detach(), y)
+            n_batches += 1
 
-    for epoch in range(cfg.WARMUP_EPOCHS):
-        tr_loss, tr_acc = run_epoch(train=True)
-        va_loss, va_acc = run_epoch(train=False)
+        tr_loss = running_loss / max(1, n_batches)
+        tr_acc = running_acc / max(1, n_batches)
+        va_loss, va_acc = eval_val()
+
         print(f"[Warmup {epoch+1}/{cfg.WARMUP_EPOCHS}] train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
+        history_rows.append({"phase":"warmup","epoch":epoch+1,"lr":cfg.LR_WARMUP,"train_loss":tr_loss,"train_acc":tr_acc,"val_loss":va_loss,"val_acc":va_acc})
+
         if va_acc > best_val_acc:
             best_val_acc = va_acc
             torch.save(model.state_dict(), best_path)
+            no_improve = 0
+        else:
+            no_improve += 1
 
+    # ---- Fine-tune: unfreeze last blocks ----
     _unfreeze_last_blocks(model, n_blocks=cfg.UNFREEZE_LAST_BLOCKS)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                                  lr=cfg.LR_FINETUNE, weight_decay=cfg.WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.LR_FINETUNE,
+        weight_decay=cfg.WEIGHT_DECAY
+    )
 
     for epoch in range(cfg.FINETUNE_EPOCHS):
-        tr_loss, tr_acc = run_epoch(train=True)
-        va_loss, va_acc = run_epoch(train=False)
-        print(f"[Finetune {epoch+1}/{cfg.FINETUNE_EPOCHS}] train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
+        model.train()
+
+        # cosine lr over epochs
+        t = epoch / max(1, cfg.FINETUNE_EPOCHS - 1)
+        lr = cfg.LR_FINETUNE * (0.5 * (1.0 + math.cos(math.pi * t)))
+        set_lr(lr)
+
+        running_loss = 0.0
+        running_acc = 0.0
+        n_batches = 0
+
+        optimizer.zero_grad(set_to_none=True)
+        for step, (x, y, _) in enumerate(train_loader):
+            x = x.to(DEVICE)
+            y = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
+
+            with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+                if cfg.MIXUP_ALPHA > 0:
+                    x_mix, y_soft = _mixup_batch(x, y, cfg.MIXUP_ALPHA)
+                    logits = model(x_mix)
+                    loss = _soft_cross_entropy(logits, y_soft) / cfg.GRAD_ACCUM_STEPS
+                    # for reporting acc use hard labels without mixup
+                    acc = _accuracy_from_logits(logits.detach(), torch.argmax(y_soft, dim=1))
+                else:
+                    logits = model(x)
+                    loss = ce(logits, y) / cfg.GRAD_ACCUM_STEPS
+                    acc = _accuracy_from_logits(logits.detach(), y)
+
+            scaler.scale(loss).backward()
+
+            if (step + 1) % cfg.GRAD_ACCUM_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            running_loss += float(loss.item()) * cfg.GRAD_ACCUM_STEPS
+            running_acc += acc
+            n_batches += 1
+
+        tr_loss = running_loss / max(1, n_batches)
+        tr_acc = running_acc / max(1, n_batches)
+        va_loss, va_acc = eval_val()
+
+        print(f"[Finetune {epoch+1}/{cfg.FINETUNE_EPOCHS}] lr {lr:.6f} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
+        history_rows.append({"phase":"finetune","epoch":epoch+1,"lr":lr,"train_loss":tr_loss,"train_acc":tr_acc,"val_loss":va_loss,"val_acc":va_acc})
+
         if va_acc > best_val_acc:
             best_val_acc = va_acc
             torch.save(model.state_dict(), best_path)
+            no_improve = 0
+        else:
+            no_improve += 1
 
+        if no_improve >= cfg.EARLY_STOP_PATIENCE:
+            print(f"🛑 Early stopping: no val improvement for {cfg.EARLY_STOP_PATIENCE} epochs.")
+            break
+
+    # save logs
+    pd.DataFrame(history_rows).to_csv(log_path, index=False)
+
+    # load best
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-    
-    # Cleanup best_path immediately after loading to keep outputs clean
-    try:
-        if best_path.exists():
-            best_path.unlink()
-    except Exception: pass
+    torch.save(model.state_dict(), last_path)
 
-    return model, eval_tf
+    info = {
+        "best_val_acc": best_val_acc,
+        "best_path": str(best_path),
+        "last_path": str(last_path),
+        "log_path": str(log_path),
+    }
+    print(f"✅ Training complete. Best val acc={best_val_acc:.4f}")
+    return model, eval_tf, info
 
-
-# -----------------------
-# 10) Evaluation + predictions CSV (with LLM columns) + confusion matrix
-# -----------------------
+# ============================================================
+# 11) Evaluation (rich CSV + plots + confusion + accuracy)
+# ============================================================
 def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, title: str):
     fig = plt.figure()
     plt.imshow(cm, interpolation="nearest")
@@ -968,111 +1156,23 @@ def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, tit
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
-def _fallback_feedback(true_label: str, pred_label: str, confidence: float) -> Dict[str, str]:
-    keep = "Maintain clear visibility of hip, knee, and ankle joints with consistent lighting."
-
-    if true_label == "good" and pred_label == "bad":
-        improve = "Refine 'good' examples: Ensure heels remain flat, knees track strictly over toes, and spine maintains neutral alignment. Avoid ambiguous camera angles."
-    elif true_label == "bad" and pred_label == "good":
-        improve = "Clarify 'bad' examples: Exaggerate specific faults (e.g., severe knee valgus, heel lift, rounded back) to create a distinct decision boundary from neutral poses."
-    else:
-        improve = "Diversify camera angles and background environments to improve model robustness against visual variations."
-
-    summary = f"pred={pred_label}. {keep} {improve}"
-    return {
-        "llm_generator": "fallback",
-        "keep": keep,
-        "improve": improve,
-        "llm_summary": summary,
-    }
-
-def _openai_feedback_optional(true_label: str, pred_label: str, confidence: float) -> Optional[Dict[str, str]]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        import openai  
-    except Exception:
-        return None
-
-    try:
-        msg = (
-            "Return JSON with keys: keep, improve, llm_summary.\n"
-            f"True label: {true_label}\nPred label: {pred_label}\nConfidence: {confidence:.2f}\n"
-            "Style: High-quality, precise technical coaching tips for computer vision dataset improvement.\n"
-            "Provide ONE strong 'keep' point (what is good about data quality) and ONE actionable 'improve' point (how to fix the squat form or data labeling)."
-        )
-        client = openai.OpenAI(api_key=api_key) 
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role":"user","content": msg}],
-            temperature=0.2
-        )
-        text = resp.choices[0].message.content or ""
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if not m:
-            return None
-        data = json.loads(m.group(0))
-        return {
-            "llm_generator": "openai",
-            "keep": str(data.get("keep","")).strip(),
-            "improve": str(data.get("improve","")).strip(),
-            "llm_summary": str(data.get("llm_summary","")).strip(),
-        }
-    except Exception:
-        return None
-
-def _attach_llm_columns(df: pd.DataFrame, max_openai: int = 60) -> pd.DataFrame:
-
-    if df.empty:
-        return df
-
-    df = df.copy()
-    for col in ["llm_generator","keep","improve","llm_summary"]:
-        df[col] = ""
-
-    cand = df.copy()
-    cand["rank"] = 0
-    cand.loc[cand["correct"] == False, "rank"] = 2
-    cand.loc[(cand["correct"] == True) & (cand["confidence"] < 0.60), "rank"] = 1
-    cand = cand.sort_values(["rank","confidence"], ascending=[False, True]).head(max_openai)
-
-    openai_idx = set(cand.index.tolist())
-
-    for i, row in df.iterrows():
-        true_label = row["true_label"]
-        pred_label = row["pred_label"]
-        conf = float(row["confidence"])
-
-        fb = None
-        if i in openai_idx:
-            fb = _openai_feedback_optional(true_label, pred_label, conf)
-
-        if fb is None:
-            fb = _fallback_feedback(true_label, pred_label, conf)
-
-        for k, v in fb.items():
-            df.at[i, k] = v
-
-    return df
-
 def plot_performance_metrics(df: pd.DataFrame, split_name: str):
-    # 1. Confidence Histogram
-    plt.figure(figsize=(7, 5))
-    corr = df[df["correct"] == True]["confidence"]
-    incorr = df[df["correct"] == False]["confidence"]
-    
-    plt.hist(corr, bins=20, alpha=0.6, color="green", label="Correct")
-    plt.hist(incorr, bins=20, alpha=0.6, color="red", label="Incorrect")
-    plt.xlabel("Confidence Score")
-    plt.ylabel("Count")
-    plt.title(f"Model Confidence: Correct vs Incorrect ({split_name})")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
-    plt.close()
+    # confidence histogram
+    if "confidence" in df.columns:
+        plt.figure(figsize=(7, 5))
+        corr = df[df["correct"] == True]["confidence"]
+        incorr = df[df["correct"] == False]["confidence"]
+        plt.hist(corr, bins=20, alpha=0.6, label="Correct")
+        plt.hist(incorr, bins=20, alpha=0.6, label="Incorrect")
+        plt.xlabel("Confidence")
+        plt.ylabel("Count")
+        plt.title(f"Confidence: Correct vs Incorrect ({split_name})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
+        plt.close()
 
-    # 2. ROC Curve
+    # roc
     if "p_good" in df.columns and "true_label" in df.columns:
         y_true = (df["true_label"] == "good").astype(int)
         y_scores = df["p_good"]
@@ -1080,14 +1180,14 @@ def plot_performance_metrics(df: pd.DataFrame, split_name: str):
         roc_auc = auc(fpr, tpr)
 
         plt.figure(figsize=(7, 5))
-        plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
-        plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title(f"ROC Curve ({split_name})")
-        plt.legend(loc="lower right")
+        plt.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.2f}")
+        plt.plot([0, 1], [0, 1], lw=2, linestyle="--")
+        plt.xlim([0, 1])
+        plt.ylim([0, 1.05])
+        plt.xlabel("FPR")
+        plt.ylabel("TPR")
+        plt.title(f"ROC ({split_name})")
+        plt.legend()
         plt.tight_layout()
         plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
         plt.close()
@@ -1097,7 +1197,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     if len(ds) == 0:
         return pd.DataFrame(), {"split": split_name, "note": "empty split"}
 
-    loader = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=2)
+    loader = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=num_workers_auto())
 
     model.eval()
     rows = []
@@ -1107,12 +1207,14 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     with torch.no_grad():
         for x, y, names in loader:
             x = x.to(DEVICE)
+            y_t = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
+
             logits = model(x)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
             pred = np.argmax(probs, axis=1)
 
             for j in range(len(names)):
-                true_y = int(y[j])
+                true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
                 conf = float(np.max(probs[j]))
                 rows.append({
@@ -1130,35 +1232,73 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
     df = pd.DataFrame(rows)
 
-    df = _attach_llm_columns(df)
-
-    plot_performance_metrics(df, split_name)
-
-    # Save CSV without confidence and p_bad as requested
-    cols_to_save = [c for c in df.columns if c not in ["confidence", "p_bad"]]
+    # save rich CSV (keep p_good, remove p_bad optional)
+    cols_to_save = [c for c in df.columns if c != "p_bad"]
     df[cols_to_save].to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
     save_confusion_matrix(cm, ["bad", "good"], OUTPUT_DIR / f"confusion_{split_name}.png",
                           title=f"Confusion Matrix ({split_name})")
 
+    # classification report (dict + print)
+    rep = classification_report(
+        all_y, all_p,
+        labels=[0, 1],
+        target_names=["bad", "good"],
+        output_dict=True,
+        zero_division=0
+    )
+    (OUTPUT_DIR / f"classification_report_{split_name}.json").write_text(
+        json.dumps(rep, indent=2), encoding="utf-8"
+    )
+
+    # ✅ מה שהיה חסר: הדפסה למסך כמו בתמונה
+    rep_txt = classification_report(
+        all_y, all_p,
+        labels=[0, 1],
+        target_names=["bad", "good"],
+        digits=4,
+        zero_division=0
+    )
+    print(f"\n=== classification_report ({split_name}) ===\n{rep_txt}")
+
+    # אופציונלי: גם לשמור TXT קריא
+    (OUTPUT_DIR / f"classification_report_{split_name}.txt").write_text(rep_txt, encoding="utf-8")
+
+    # אופציונלי: להכניס F1 לסיכום (כדי שיופיע גם ב-README / prints)
+    f1_macro = float(rep["macro avg"]["f1-score"])
+    f1_weighted = float(rep["weighted avg"]["f1-score"])
+
+
+    plot_performance_metrics(df, split_name)
+
     summary = {
         "split": split_name,
         "n": int(len(df)),
         "accuracy": float(df["correct"].mean() if len(df) else 0.0),
         "confusion_matrix": cm.tolist(),
+        
     }
+    summary.update({
+    "f1_bad": float(rep["bad"]["f1-score"]),
+    "f1_good": float(rep["good"]["f1-score"]),
+    "f1_macro": float(rep["macro avg"]["f1-score"]),
+    "f1_weighted": float(rep["weighted avg"]["f1-score"]),
+    })
+
     print(f"\n[{split_name}] accuracy={summary['accuracy']:.4f}")
     return df, summary
 
-
-# -----------------------
-# 11) README
-# -----------------------
+# ============================================================
+# 12) README + Zip artifact
+# ============================================================
 def write_readme(summaries: List[Dict], note: str = ""):
     lines = []
     lines.append("# PoseAITraining — Run Summary\n")
-    lines.append("## Config\n")
+    lines.append("## Project structure (required by instructor)\n")
+    lines.append("- Part 1: Synthetic data generation using 3D pose extraction + 3D pose manipulation + ControlNet Img2Img\n")
+    lines.append("- Part 2: Fine-tune a pretrained ViT image model to classify Good vs Bad squats using synthetic data\n")
+    lines.append("\n## Config\n")
     lines.append(f"- Device: {DEVICE}\n")
     lines.append(f"- TOTAL_IMAGES: {cfg.TOTAL_IMAGES}\n")
     lines.append(f"- VAL_RATIO: {cfg.VAL_RATIO}\n")
@@ -1166,13 +1306,14 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append(f"- WARMUP_EPOCHS: {cfg.WARMUP_EPOCHS}\n")
     lines.append(f"- FINETUNE_EPOCHS: {cfg.FINETUNE_EPOCHS}\n")
     lines.append(f"- UNFREEZE_LAST_BLOCKS: {cfg.UNFREEZE_LAST_BLOCKS}\n")
+    lines.append(f"- MIXUP_ALPHA: {cfg.MIXUP_ALPHA}\n")
+    lines.append(f"- LABEL_SMOOTHING: {cfg.LABEL_SMOOTHING}\n")
+
     lines.append("\n## Outputs\n")
-    lines.append("- `outputs/eda_*.png` + `outputs/eda_*json` + `outputs/eda_*.csv` (expanded EDA)\n")
-    lines.append("- `outputs/eda_class_counts.png` + `outputs/eda_hist_sharpness.png` (Focused EDA)\n")
-    lines.append("- `outputs/*_predictions.csv` (includes keep/improve/summary columns)\n")
-    lines.append("- `outputs/confusion_*.png` + `outputs/classification_report_*.json`\n")
-    lines.append("- `outputs/vit_squat.pth` + `outputs/vit_squat_best.pth`\n")
-    lines.append("- `outputs/PoseAITraining_artifact.zip`\n")
+    lines.append("- outputs/eda_counts.csv + outputs/eda_class_counts.png\n")
+    lines.append("- outputs/*_predictions.csv + confusion_*.png + classification_report_*.json\n")
+    lines.append("- outputs/vit_squat_best.pth + outputs/vit_squat_last.pth + outputs/train_log.csv\n")
+    lines.append(f"- outputs/{cfg.ZIP_NAME}\n")
 
     if note.strip():
         lines.append("\n## Notes\n")
@@ -1182,15 +1323,12 @@ def write_readme(summaries: List[Dict], note: str = ""):
     for s in summaries:
         lines.append(f"### {s.get('split','?')}\n")
         lines.append(f"- n = {s.get('n',0)}\n")
-        lines.append(f"- accuracy = {s.get('accuracy',0):.4f}\n")
+        if "accuracy" in s:
+            lines.append(f"- accuracy = {s.get('accuracy',0):.4f}\n")
 
     (OUTPUT_DIR / "README.md").write_text("\n".join(lines), encoding="utf-8")
     print("README saved: outputs/README.md")
 
-
-# -----------------------
-# 12) Zip artifact + download
-# -----------------------
 def zip_artifact():
     zip_path = OUTPUT_DIR / cfg.ZIP_NAME
     if zip_path.exists():
@@ -1205,7 +1343,6 @@ def zip_artifact():
             for p in OUTPUT_DIR.rglob("*"):
                 if p.is_file() and p.name != cfg.ZIP_NAME:
                     z.write(p, arcname=str(p.relative_to(ROOT)))
-        # include main.py
         try:
             this_file = Path(__file__).resolve()
             if this_file.exists():
@@ -1217,77 +1354,89 @@ def zip_artifact():
 
     if _in_colab():
         try:
-            from google.colab import files 
+            from google.colab import files  # type: ignore
             files.download(str(zip_path))
         except Exception:
             pass
 
-
-# -----------------------
+# ============================================================
 # 13) Main
-# -----------------------
+# ============================================================
 def main():
     print(f"ROOT: {ROOT}")
     print(f"DEVICE: {DEVICE}")
+    print(f"Config: TOTAL_IMAGES={cfg.TOTAL_IMAGES}, FINETUNE_EPOCHS={cfg.FINETUNE_EPOCHS}, MIXUP_ALPHA={cfg.MIXUP_ALPHA}")
 
-    if not GOOD_SEEDS_DIR.exists():
-        raise FileNotFoundError("❌ seeds/good folder missing.")
-    if not list_images(GOOD_SEEDS_DIR):
-        print("⚠️ No seed images found in seeds/good. Proceeding with existing synthetic_dataset/ (generation disabled).")
-        # return  # commented to allow proceeding
+    if not GOOD_SEEDS_DIR.exists() or not list_images(GOOD_SEEDS_DIR):
+        raise FileNotFoundError("❌ seeds/good is missing or empty. Put valid squat images into seeds/good")
 
-    # ============================
-    # Stage 1 — GENERATION (DISABLED BY REQUEST)
-    # ============================
-    # אם תרצי להפעיל שוב:
-    #   - להסיר את ה-# בשורה למטה
-    #   - או להגדיר: os.environ["ENABLE_GENERATION"]="1"
-    #
-    # if os.environ.get("ENABLE_GENERATION","0") == "1":
-    #     generate_synthetic_dataset(cfg.TOTAL_IMAGES)
-    # else:
-    #     print("⚠️ Generation disabled (ENABLE_GENERATION=0). Using existing synthetic_dataset/")
-
-    print(" Generation disabled (by request). Using existing synthetic_dataset/")
+    # Stage 1 (required): generation
+    enable_gen = os.environ.get("ENABLE_GENERATION", "0") == "1"
+    auto_if_empty = os.environ.get("AUTO_GENERATE_IF_EMPTY", "1") == "1"
 
     n_train = count_images(TRAIN_DIR/"good") + count_images(TRAIN_DIR/"bad")
-    n_val   = count_images(VAL_DIR/"good")   + count_images(VAL_DIR/"bad")
+    n_val   = count_images(VAL_DIR/"good") + count_images(VAL_DIR/"bad")
+
+    if enable_gen or (auto_if_empty and (n_train == 0 or n_val == 0)):
+        generate_synthetic_dataset(cfg.TOTAL_IMAGES)
+    else:
+        print("⚠️ Generation skipped (ENABLE_GENERATION!=1 and dataset not empty). Using existing synthetic_dataset/")
+
+    # confirm data exists
+    n_train = count_images(TRAIN_DIR/"good") + count_images(TRAIN_DIR/"bad")
+    n_val   = count_images(VAL_DIR/"good") + count_images(VAL_DIR/"bad")
     if n_train == 0 or n_val == 0:
-        print("❌ No dataset found. You disabled generation, but synthetic_dataset/ is empty.")
-        print("👉 Set ENABLE_GENERATION=1 and rerun if you want to generate.")
+        print("❌ Dataset is still empty. Check paths: synthetic_dataset/train/{good,bad} and synthetic_dataset/val/{good,bad}")
+        print("👉 Tip: set ENABLE_GENERATION=1 to force generation (CUDA recommended).")
         return
 
-    model, transform = (None, None)
-    if os.environ.get("SKIP_TRAIN", "0") != "1":
-        model, transform = train_vit()
-    else:
-        print("⚠️ SKIP_TRAIN=1 -> skipping training, trying to load existing model")
+    # EDA
+    run_eda_counts()
 
-    if model is None or transform is None:
+    # Stage 2 (required): training
+    if os.environ.get("SKIP_TRAIN", "0") == "1":
+        print("⚠️ SKIP_TRAIN=1 -> skipping training, trying to load outputs/vit_squat_best.pth")
         best_path = OUTPUT_DIR / "vit_squat_best.pth"
-        if best_path.exists():
-            model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-            num_f = model.heads.head.in_features
-            model.heads.head = nn.Linear(num_f, 2)
-            model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-            model.to(DEVICE)
-            _, transform = _make_transforms()
-            print("✅ Loaded existing model from vit_squat_best.pth")
-            
-            # Remove the temporary model file to keep outputs clean
-            try:
-                best_path.unlink()
-            except Exception: pass
-        else:
-            print("❌ No model found, cannot evaluate.")
+        if not best_path.exists():
+            print("❌ No best model found.")
+            return
+        model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        model.heads.head = nn.Linear(model.heads.head.in_features, 2)
+        model.load_state_dict(torch.load(best_path, map_location=DEVICE))
+        model.to(DEVICE)
+        _, transform = _make_transforms()
+        train_info = {}
+    else:
+        model, transform, train_info = train_vit()
+        if model is None or transform is None:
+            print("❌ Training failed.")
             return
 
-    val_df, val_summary = evaluate_split(model, VAL_DIR, "val", transform)
+    # Evaluation
+    summaries: List[Dict] = []
+    _, val_summary = evaluate_split(model, VAL_DIR, "val", transform)
+    summaries.append(val_summary)
 
-    # Test predictions disabled by request
-    test_summary = {}
-    test_note = "Test predictions disabled."
+    # (Optional) test
+    if cfg.TEST_RATIO > 0 and (count_images(TEST_DIR/"good") + count_images(TEST_DIR/"bad")) > 0:
+        _, test_summary = evaluate_split(model, TEST_DIR, "test", transform)
+        summaries.append(test_summary)
 
+    # Print final accuracy (requested)
+    print("\n=== Final Accuracy ===")
+    for s in summaries:
+        if "accuracy" in s:
+            print(f"{s['split']}: accuracy={s['accuracy']:.4f} (n={s.get('n', 0)})")
+
+    note = "Generation uses 3D pose extraction + 3D pose manipulation (dragging + rotations) + ControlNet Img2Img. Training uses ViT fine-tuning with cosine LR, label smoothing, optional mixup, early stopping."
+    if train_info:
+        note += f"\nTrain artifacts: {train_info}"
+
+    write_readme(summaries, note=note)
+    print(f"{s['split']}: acc={s['accuracy']:.4f} | f1_macro={s.get('f1_macro',0):.4f} | f1_weighted={s.get('f1_weighted',0):.4f}")
+
+    if os.environ.get("SKIP_ZIP", "0") != "1":
+        zip_artifact()
 
     print("\n✅ DONE. Check outputs/")
 
