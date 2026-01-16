@@ -30,19 +30,21 @@
 
 ## Outputs
 
-- outputs/eda_counts.csv + outputs/eda_class_counts.png
+- outputs/val_predictions.csv
 
-- outputs/*_predictions.csv + confusion_*.png + classification_report_*.json
+- outputs/confidence_dist_val.png
 
-- outputs/vit_squat_best.pth + outputs/vit_squat_last.pth + outputs/train_log.csv
+- outputs/confusion_val.png
 
-- outputs/PoseAITraining_artifact.zip
+- outputs/roc_curve_val.png
+
+- outputs/README.md
 
 
 ## Notes
 
 Generation uses 3D pose extraction + 3D pose manipulation (dragging + rotations) + ControlNet Img2Img. Training uses ViT fine-tuning with cosine LR, label smoothing, optional mixup, early stopping.
-Train artifacts: {'best_val_acc': 0.77, 'best_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_best.pth', 'last_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_last.pth', 'log_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\train_log.csv'}
+Train artifacts (created then pruned in minimal mode): {'best_val_acc': 0.77, 'best_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_best.pth', 'last_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_last.pth', 'log_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\train_log.csv'}
 
 
 ## Metrics
@@ -52,3 +54,7 @@ Train artifacts: {'best_val_acc': 0.77, 'best_path': 'C:\\Users\\rotem\\Desktop\
 - n = 400
 
 - accuracy = 0.7700
+
+- f1_macro = 0.7669
+
+- f1_weighted = 0.7669
