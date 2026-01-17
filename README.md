@@ -1,60 +1,32 @@
-# PoseAITraining — Run Summary
+# Project Name: PoseAI Trainer
 
-## Project structure (required by instructor)
+## 📋 Submission Checklist
+- **Git Link**: Valid and matches project name.
+- **Presentation**: Available in **PPT** and **PDF** in `/interim_report_presentation`.
+- **Data**: All synthetic datasets (Train/Val) uploaded as ZIP files.
+- **Notebooks**: Includes Section 5.1 (Data Gen), 5.2 (EDA), and 5.3 (Baseline/Training).
 
-- Part 1: Synthetic data generation using 3D pose extraction + 3D pose manipulation + ControlNet Img2Img
+## 🚀 How to Run
+The code is designed to be **Colab-friendly** and handles dependency installation automatically.
 
-- Part 2: Fine-tune a pretrained ViT image model to classify Good vs Bad squats using synthetic data
+1. **Environment Setup**: 
+   - Ensure you have a GPU environment (CUDA) for optimal performance.
+   - The script will automatically install required libraries: `mediapipe`, `diffusers`, `transformers`, `torch`, etc.
+2. **Execution**:
+   - Run the main script/notebook: `poseAI_trainer.py`.
+   - **Generation**: By default, generation is disabled to use existing data. To enable, set `ENABLE_GENERATION=1`.
+   - **Training**: The script trains a **ViT-B/16** model and saves the best weights to `outputs/vit_squat_best.pth`.
+3. **Outputs**:
+   - After execution, a ZIP artifact `PoseAITraining_artifact.zip` will be created containing all results and a detailed summary.
 
+## 📂 Repository Layout
+*Note: Large ZIP files are kept in the root directory due to size constraints.*
 
-## Config
-
-- Device: cpu
-
-- TOTAL_IMAGES: 2000
-
-- VAL_RATIO: 0.2
-
-- TEST_RATIO: 0.0
-
-- WARMUP_EPOCHS: 1
-
-- FINETUNE_EPOCHS: 8
-
-- UNFREEZE_LAST_BLOCKS: 4
-
-- MIXUP_ALPHA: 0.0
-
-- LABEL_SMOOTHING: 0.05
-
-
-## Outputs
-
-- outputs/val_predictions.csv
-
-- outputs/confidence_dist_val.png
-
-- outputs/confusion_val.png
-
-- outputs/roc_curve_val.png
-
-- outputs/README.md
-
-
-## Notes
-
-Generation uses 3D pose extraction + 3D pose manipulation (dragging + rotations) + ControlNet Img2Img. Training uses ViT fine-tuning with cosine LR, label smoothing, optional mixup, early stopping.
-Train artifacts (created then pruned in minimal mode): {'best_val_acc': 0.77, 'best_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_best.pth', 'last_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\vit_squat_last.pth', 'log_path': 'C:\\Users\\rotem\\Desktop\\PoseAITraining_artifact\\outputs\\train_log.csv'}
-
-
-## Metrics
-
-### val
-
-- n = 400
-
-- accuracy = 0.7700
-
-- f1_macro = 0.7669
-
-- f1_weighted = 0.7669
+- **`/interim_report_presentation`**:
+  - `PoseAI_Trainer.pptx` & `PoseAI_Trainer.pdf`.
+- **`outputs/`**: Generated after run (also available in `outputs.zip`):
+  - **EDA**: Visuals and stats (`eda_class_counts.png`, `eda_stats.csv`).
+  - **Baseline**: Training results (`confusion_test.png`, `test_predictions.csv`).
+- **Root Directory**:
+  - `poseAI_trainer.py`: Main execution script.
+  - `synthetic_dataset_*.zip`: Full datasets.
