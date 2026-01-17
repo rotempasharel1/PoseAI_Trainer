@@ -62,22 +62,22 @@ def ensure_deps():
     _maybe_fix_shadowing("mediapipe")
 
     try:
-        import mediapipe as mp  # type: ignore
+        import mediapipe as mp  
         ok_mp = hasattr(mp, "solutions")
         if not ok_mp:
             raise RuntimeError("mediapipe import exists but mp.solutions is missing (broken install or shadowed).")
-        import diffusers  # type: ignore
-        import transformers  # type: ignore
-        import accelerate  # type: ignore
-        import cv2  # type: ignore
-        import PIL  # type: ignore
-        import numpy  # type: ignore
-        import pandas  # type: ignore
-        import sklearn  # type: ignore
-        import matplotlib  # type: ignore
-        import tqdm  # type: ignore
-        import torch  # type: ignore
-        import torchvision  # type: ignore
+        import diffusers  
+        import transformers  
+        import accelerate  
+        import cv2  
+        import PIL  
+        import numpy  
+        import pandas 
+        import sklearn 
+        import matplotlib  
+        import tqdm 
+        import torch  
+        import torchvision  
     except Exception as e:
         print("Installing/repairing dependencies...")
         print("Reason:", repr(e))
@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass
 class CFG:
-    # generation
+
     TOTAL_IMAGES: int = 2000
     VAL_RATIO: float = 0.2
     TEST_RATIO: float = 0.0
@@ -131,7 +131,6 @@ class CFG:
     CONTROL_SIZE: int = 512
     CANVAS_MARGIN: float = 0.08
 
-    # training
     BATCH_SIZE: int = 16
     WARMUP_EPOCHS: int = 1
     FINETUNE_EPOCHS: int = 8
@@ -144,10 +143,8 @@ class CFG:
     GRAD_ACCUM_STEPS: int = 1
     EARLY_STOP_PATIENCE: int = 3
 
-    # mixup (optional)
-    MIXUP_ALPHA: float = 0.0  # set env MIXUP_ALPHA=0.2 to enable
+    MIXUP_ALPHA: float = 0.0  
 
-    # stable diffusion
     SD_MODEL: str = "runwayml/stable-diffusion-v1-5"
     CONTROLNET_MODEL: str = "lllyasviel/sd-controlnet-openpose"
 
@@ -179,7 +176,6 @@ class CFG:
 
 cfg = CFG()
 
-# override from env
 cfg.TOTAL_IMAGES = _env_int("TOTAL_IMAGES", cfg.TOTAL_IMAGES)
 cfg.FINETUNE_EPOCHS = _env_int("FINETUNE_EPOCHS", cfg.FINETUNE_EPOCHS)
 cfg.WARMUP_EPOCHS = _env_int("WARMUP_EPOCHS", cfg.WARMUP_EPOCHS)
@@ -643,7 +639,7 @@ def generate_synthetic_dataset(total_images: int):
     print(f"\n=== Stage 1: Synthetic dataset (3D pose → manipulate → ControlNet Img2Img) on {DEVICE} ===")
 
     if DEVICE != "cuda" and os.environ.get("ALLOW_CPU_GENERATION", "0") != "1":
-        print("❌ Generation requires CUDA by default. Set ALLOW_CPU_GENERATION=1 to force CPU (slow).")
+        print("Generation requires CUDA by default. Set ALLOW_CPU_GENERATION=1 to force CPU (slow).")
         return
 
     good_seeds = list_images(GOOD_SEEDS_DIR)
@@ -793,7 +789,7 @@ def generate_synthetic_dataset(total_images: int):
     if train_bad_from_badseeds > 0:
         fill_split("train", "bad", train_bad_target, rr_bad, source="extra_bad_from_badseeds")
 
-    print("\n✅ Generation complete. Final counts:", {
+    print("\n Generation complete. Final counts:", {
         sp: {"good": count_images(SYNTH_DIR/sp/"good"), "bad": count_images(SYNTH_DIR/sp/"bad")}
         for sp in ["train", "val", "test"]
     })
@@ -898,7 +894,7 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     val_ds   = SquatDataset(VAL_DIR, transform=eval_tf)
 
     if len(train_ds) == 0 or len(val_ds) == 0:
-        print("❌ Missing training/val data in synthetic_dataset/.")
+        print(" Missing training/val data in synthetic_dataset/.")
         return None, None, {}
 
     ys = [y for _, y in train_ds.samples]
@@ -1056,10 +1052,9 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
             no_improve += 1
 
         if no_improve >= cfg.EARLY_STOP_PATIENCE:
-            print(f"🛑 Early stopping: no val improvement for {cfg.EARLY_STOP_PATIENCE} epochs.")
+            print(f"Early stopping: no val improvement for {cfg.EARLY_STOP_PATIENCE} epochs.")
             break
 
-    # Save logs & weights (will be pruned in minimal mode)
     pd.DataFrame(history_rows).to_csv(log_path, index=False)
 
     if best_path.exists():
@@ -1072,7 +1067,7 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         "last_path": str(last_path),
         "log_path": str(log_path),
     }
-    print(f"✅ Training complete. Best val acc={best_val_acc:.4f}")
+    print(f"Training complete. Best val acc={best_val_acc:.4f}")
     return model, eval_tf, info
 
 # ============================================================
@@ -1101,7 +1096,6 @@ def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, tit
     plt.close(fig)
 
 def plot_performance_metrics(df: pd.DataFrame, split_name: str):
-    # confidence histogram
     if "confidence" in df.columns:
         plt.figure(figsize=(7, 5))
         corr = df[df["correct"] == True]["confidence"]
@@ -1116,7 +1110,6 @@ def plot_performance_metrics(df: pd.DataFrame, split_name: str):
         plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
         plt.close()
 
-    # roc
     if "p_good" in df.columns and "true_label" in df.columns:
         y_true = (df["true_label"] == "good").astype(int)
         y_scores = df["p_good"]
@@ -1136,7 +1129,6 @@ def plot_performance_metrics(df: pd.DataFrame, split_name: str):
         plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
         plt.close()
 
-# ---- LLM-like feedback (no API key required) — ENGLISH ONLY
 def _english_feedback_templates():
     keep_good = [
         "Heels stay grounded throughout the movement",
@@ -1169,7 +1161,6 @@ def _english_feedback_templates():
 def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
     keep_good, improve_good, keep_bad, improve_bad = _english_feedback_templates()
 
-    # Base feedback based on the TRUE label
     if true_label == "good":
         keep = " ; ".join(random.sample(keep_good, k=min(2, len(keep_good))))
         improve = " ; ".join(random.sample(improve_good, k=min(2, len(improve_good))))
@@ -1179,12 +1170,11 @@ def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, co
         improve = " ; ".join(random.sample(improve_bad, k=min(2, len(improve_bad))))
         base = "Technique needs improvement—focus on a few key fixes with controlled reps."
 
-    # Add model-related note
     note = ""
     if not correct:
-        note = "⚠️ The model misclassified this example—consider a quick manual review."
+        note = "The model misclassified this example—consider a quick manual review."
     elif confidence < 0.70:
-        note = "ℹ️ Lower confidence—this may be a borderline or challenging image (angle/lighting/occlusion)."
+        note = "Lower confidence—this may be a borderline or challenging image (angle/lighting/occlusion)."
 
     summary = base if not note else f"{base} {note}"
     return {"llm_keep": keep, "llm_improve": improve, "llm_summary": summary}
@@ -1209,6 +1199,17 @@ def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Evaluates a split directory (train/val/test), writes:
+      - outputs/{split_name}_predictions.csv  (ONLY requested columns)
+      - outputs/confusion_{split_name}.png
+      - outputs/confidence_dist_{split_name}.png
+      - outputs/roc_curve_{split_name}.png   (computed internally, not saved in CSV)
+
+    Returns:
+      df (with ONLY requested columns)
+      summary dict (accuracy + f1 metrics + confusion matrix)
+    """
     ds = SquatDataset(split_dir, transform=transform)
     if len(ds) == 0:
         return pd.DataFrame(), {"split": split_name, "note": "empty split"}
@@ -1216,9 +1217,10 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     loader = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=num_workers_auto())
 
     model.eval()
-    rows = []
-    all_y = []
-    all_p = []
+    rows: List[Dict[str, Any]] = []
+    all_y: List[int] = []
+    all_p: List[int] = []
+    p_good_list: List[float] = []  
 
     with torch.no_grad():
         for x, y, names in loader:
@@ -1226,37 +1228,77 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
             y_t = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
 
             logits = model(x)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            probs = torch.softmax(logits, dim=1).cpu().numpy()  # shape: [B, 2]
             pred = np.argmax(probs, axis=1)
 
             for j in range(len(names)):
                 true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
                 conf = float(np.max(probs[j]))
+                p_good = float(probs[j][1])
 
                 rows.append({
-                    "split": split_name,
                     "image_name": names[j],
                     "true_label": "good" if true_y == 1 else "bad",
                     "pred_label": "good" if pred_y == 1 else "bad",
                     "confidence": conf,
                     "correct": (true_y == pred_y),
-                    "p_good": float(probs[j][1]),
                 })
+
                 all_y.append(true_y)
                 all_p.append(pred_y)
+                p_good_list.append(p_good)
 
     df = pd.DataFrame(rows)
 
-    # ✅ add LLM-like feedback columns
     df = add_llm_columns(df)
 
-    # Save predictions CSV
+    keep_cols = ["image_name", "true_label", "pred_label", "confidence", "correct", "llm_keep", "llm_improve"]
+    df = df[keep_cols]
+
     df.to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
-    save_confusion_matrix(cm, ["bad", "good"], OUTPUT_DIR / f"confusion_{split_name}.png",
-                          title=f"Confusion Matrix ({split_name})")
+    save_confusion_matrix(
+        cm,
+        ["bad", "good"],
+        OUTPUT_DIR / f"confusion_{split_name}.png",
+        title=f"Confusion Matrix ({split_name})"
+    )
+
+    plt.figure(figsize=(7, 5))
+    corr = df[df["correct"] == True]["confidence"]
+    incorr = df[df["correct"] == False]["confidence"]
+    plt.hist(corr, bins=20, alpha=0.6, label="Correct")
+    plt.hist(incorr, bins=20, alpha=0.6, label="Incorrect")
+    plt.xlabel("Confidence")
+    plt.ylabel("Count")
+    plt.title(f"Confidence: Correct vs Incorrect ({split_name})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
+    plt.close()
+
+    try:
+        y_true = np.array(all_y, dtype=np.int32)
+        y_scores = np.array(p_good_list, dtype=np.float32)
+        fpr, tpr, _ = roc_curve(y_true, y_scores)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.2f}")
+        plt.plot([0, 1], [0, 1], lw=2, linestyle="--")
+        plt.xlim([0, 1])
+        plt.ylim([0, 1.05])
+        plt.xlabel("FPR")
+        plt.ylabel("TPR")
+        plt.title(f"ROC ({split_name})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"⚠️ ROC plot skipped: {e}")
 
     rep_txt = classification_report(
         all_y, all_p,
@@ -1266,8 +1308,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
         zero_division=0
     )
     print(f"\n=== classification_report ({split_name}) ===\n{rep_txt}")
-
-    plot_performance_metrics(df, split_name)
 
     rep = classification_report(
         all_y, all_p,
@@ -1290,6 +1330,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
     print(f"\n[{split_name}] accuracy={summary['accuracy']:.4f} | f1_macro={summary['f1_macro']:.4f} | f1_weighted={summary['f1_weighted']:.4f}")
     return df, summary
+
 
 # ============================================================
 # 11) README (minimal)
@@ -1343,7 +1384,7 @@ def main():
     print(f"Config: TOTAL_IMAGES={cfg.TOTAL_IMAGES}, FINETUNE_EPOCHS={cfg.FINETUNE_EPOCHS}, MIXUP_ALPHA={cfg.MIXUP_ALPHA}")
 
     if not GOOD_SEEDS_DIR.exists() or not list_images(GOOD_SEEDS_DIR):
-        raise FileNotFoundError("❌ seeds/good is missing or empty. Put valid squat images into seeds/good")
+        raise FileNotFoundError("seeds/good is missing or empty. Put valid squat images into seeds/good")
 
     enable_gen = os.environ.get("ENABLE_GENERATION", "0") == "1"
     auto_if_empty = os.environ.get("AUTO_GENERATE_IF_EMPTY", "1") == "1"
@@ -1354,21 +1395,20 @@ def main():
     if enable_gen or (auto_if_empty and (n_train == 0 or n_val == 0)):
         generate_synthetic_dataset(cfg.TOTAL_IMAGES)
     else:
-        print("⚠️ Generation skipped (ENABLE_GENERATION!=1 and dataset not empty). Using existing synthetic_dataset/")
+        print("Generation skipped (ENABLE_GENERATION!=1 and dataset not empty). Using existing synthetic_dataset/")
 
     n_train = count_images(TRAIN_DIR/"good") + count_images(TRAIN_DIR/"bad")
     n_val   = count_images(VAL_DIR/"good") + count_images(VAL_DIR/"bad")
     if n_train == 0 or n_val == 0:
-        print("❌ Dataset is still empty. Check paths: synthetic_dataset/train/{good,bad} and synthetic_dataset/val/{good,bad}")
-        print("👉 Tip: set ENABLE_GENERATION=1 to force generation (CUDA recommended).")
+        print(" Dataset is still empty. Check paths: synthetic_dataset/train/{good,bad} and synthetic_dataset/val/{good,bad}")
+        print(" Tip: set ENABLE_GENERATION=1 to force generation (CUDA recommended).")
         return
 
-    # Train
     if os.environ.get("SKIP_TRAIN", "0") == "1":
-        print("⚠️ SKIP_TRAIN=1 -> skipping training, trying to load outputs/vit_squat_best.pth")
+        print(" SKIP_TRAIN=1 -> skipping training, trying to load outputs/vit_squat_best.pth")
         best_path = OUTPUT_DIR / "vit_squat_best.pth"
         if not best_path.exists():
-            print("❌ No best model found.")
+            print(" No best model found.")
             return
         model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
         model.heads.head = nn.Linear(model.heads.head.in_features, 2)
@@ -1379,7 +1419,7 @@ def main():
     else:
         model, transform, train_info = train_vit()
         if model is None or transform is None:
-            print("❌ Training failed.")
+            print("Training failed.")
             return
 
     summaries: List[Dict] = []
@@ -1399,7 +1439,6 @@ def main():
     for s in summaries:
         print(f"{s['split']}: acc={s['accuracy']:.4f} | f1_macro={s.get('f1_macro',0):.4f} | f1_weighted={s.get('f1_weighted',0):.4f}")
 
-    # keep outputs minimal
     if MINIMAL_OUTPUT:
         prune_outputs_dir()
 
