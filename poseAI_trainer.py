@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import os
 import re
 import sys
@@ -13,7 +12,82 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
-from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
+from sklearn.metrics import confusion_matrix, classification_report
+from dotenv import load_dotenv 
+load_dotenv()
+# --- OpenAI (real LLM) ---
+from openai import OpenAI
+
+_OPENAI_CLIENT: Optional[OpenAI] = None
+
+def _get_openai_client() -> Optional[OpenAI]:
+    global _OPENAI_CLIENT
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI(api_key=api_key)
+    return _OPENAI_CLIENT
+
+def llm_feedback_for_row_openai(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
+    """
+    Uses OpenAI API (gpt-4o-mini) and returns:
+    {"llm_keep": "...", "llm_improve": "..."}
+    """
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    system_msg = (
+        "You are a strict, helpful squat-technique evaluator. "
+        "Return concise coaching feedback in English only."
+    )
+
+    user_msg = f"""
+Context:
+- true_label: {true_label}
+- pred_label: {pred_label}
+- confidence: {confidence:.4f}
+- correct: {correct}
+
+Task:
+Return JSON with:
+- llm_keep: 2 short points separated by " ; "
+- llm_improve: 2 short points separated by " ; "
+Rules:
+- English only
+- No extra keys
+- No markdown
+"""
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "llm_keep": {"type": "string"},
+            "llm_improve": {"type": "string"},
+        },
+        "required": ["llm_keep", "llm_improve"],
+    }
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "squat_feedback",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+
+    data = json.loads(resp.output_text)
+    return {"llm_keep": data["llm_keep"], "llm_improve": data["llm_improve"]}
 
 # ============================================================
 # 0) Dependency setup (Colab-friendly, with REAL validation)
@@ -91,7 +165,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import copy
 import torch
 import torch.nn as nn
 
@@ -226,7 +300,6 @@ def allowed_output_files() -> set:
         "val_predictions.csv",
         "confidence_dist_val.png",
         "confusion_val.png",
-        "roc_curve_val.png",
         "README.md",
     }
 
@@ -886,7 +959,7 @@ def _mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float) -> Tuple[torch.
     return x_mix, y_mix
 
 def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict[str, Any]]:
-    print("\n=== Stage 2: Train ViT-B/16 on synthetic data (improved) ===")
+    print("\n=== Stage 2: Train ViT-B/16 on synthetic data (no extra output files) ===")
 
     train_tf, eval_tf = _make_transforms()
 
@@ -915,10 +988,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, sampler=sampler, num_workers=num_workers)
     val_loader   = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=num_workers)
 
-    best_path = OUTPUT_DIR / "vit_squat_best.pth"
-    last_path = OUTPUT_DIR / "vit_squat_last.pth"
-    log_path  = OUTPUT_DIR / "train_log.csv"
-
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.LR_WARMUP,
@@ -946,10 +1015,11 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
                 accs.append(_accuracy_from_logits(logits, y))
         return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
 
-    history_rows = []
     best_val_acc = -1.0
     no_improve = 0
+    best_state_dict = None
 
+    # --- Warmup ---
     for epoch in range(cfg.WARMUP_EPOCHS):
         model.train()
         set_lr(cfg.LR_WARMUP)
@@ -983,15 +1053,15 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         va_loss, va_acc = eval_val()
 
         print(f"[Warmup {epoch+1}/{cfg.WARMUP_EPOCHS}] train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
-        history_rows.append({"phase":"warmup","epoch":epoch+1,"lr":cfg.LR_WARMUP,"train_loss":tr_loss,"train_acc":tr_acc,"val_loss":va_loss,"val_acc":va_acc})
 
         if va_acc > best_val_acc:
             best_val_acc = va_acc
-            torch.save(model.state_dict(), best_path)
+            best_state_dict = copy.deepcopy(model.state_dict())
             no_improve = 0
         else:
             no_improve += 1
 
+    # --- Finetune ---
     _unfreeze_last_blocks(model, n_blocks=cfg.UNFREEZE_LAST_BLOCKS)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1042,11 +1112,10 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         va_loss, va_acc = eval_val()
 
         print(f"[Finetune {epoch+1}/{cfg.FINETUNE_EPOCHS}] lr {lr:.6f} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
-        history_rows.append({"phase":"finetune","epoch":epoch+1,"lr":lr,"train_loss":tr_loss,"train_acc":tr_acc,"val_loss":va_loss,"val_acc":va_acc})
 
         if va_acc > best_val_acc:
             best_val_acc = va_acc
-            torch.save(model.state_dict(), best_path)
+            best_state_dict = copy.deepcopy(model.state_dict())
             no_improve = 0
         else:
             no_improve += 1
@@ -1055,20 +1124,13 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
             print(f"Early stopping: no val improvement for {cfg.EARLY_STOP_PATIENCE} epochs.")
             break
 
-    pd.DataFrame(history_rows).to_csv(log_path, index=False)
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
 
-    if best_path.exists():
-        model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-    torch.save(model.state_dict(), last_path)
-
-    info = {
-        "best_val_acc": best_val_acc,
-        "best_path": str(best_path),
-        "last_path": str(last_path),
-        "log_path": str(log_path),
-    }
     print(f"Training complete. Best val acc={best_val_acc:.4f}")
-    return model, eval_tf, info
+    return model, eval_tf, {"best_val_acc": best_val_acc}
+
+
 
 # ============================================================
 # 10) Evaluation + plots + LLM-like feedback columns
@@ -1095,39 +1157,6 @@ def save_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: Path, tit
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
-def plot_performance_metrics(df: pd.DataFrame, split_name: str):
-    if "confidence" in df.columns:
-        plt.figure(figsize=(7, 5))
-        corr = df[df["correct"] == True]["confidence"]
-        incorr = df[df["correct"] == False]["confidence"]
-        plt.hist(corr, bins=20, alpha=0.6, label="Correct")
-        plt.hist(incorr, bins=20, alpha=0.6, label="Incorrect")
-        plt.xlabel("Confidence")
-        plt.ylabel("Count")
-        plt.title(f"Confidence: Correct vs Incorrect ({split_name})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
-        plt.close()
-
-    if "p_good" in df.columns and "true_label" in df.columns:
-        y_true = (df["true_label"] == "good").astype(int)
-        y_scores = df["p_good"]
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        roc_auc = auc(fpr, tpr)
-
-        plt.figure(figsize=(7, 5))
-        plt.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.2f}")
-        plt.plot([0, 1], [0, 1], lw=2, linestyle="--")
-        plt.xlim([0, 1])
-        plt.ylim([0, 1.05])
-        plt.xlabel("FPR")
-        plt.ylabel("TPR")
-        plt.title(f"ROC ({split_name})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
-        plt.close()
 
 def _english_feedback_templates():
     keep_good = [
@@ -1159,28 +1188,32 @@ def _english_feedback_templates():
     return keep_good, improve_good, keep_bad, improve_bad
 
 def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
+    """
+    Hybrid:
+    - If OPENAI_API_KEY exists + USE_OPENAI_LLM=1 -> use OpenAI (gpt-4o-mini)
+    - Else -> fallback to templates
+    """
+    if os.environ.get("USE_OPENAI_LLM", "1") == "1":
+        try:
+            return llm_feedback_for_row_openai(true_label, pred_label, confidence, correct)
+        except Exception as e:
+            print(f"⚠️ OpenAI LLM failed, falling back to templates: {e}")
+
+    # fallback (your existing templates)
     keep_good, improve_good, keep_bad, improve_bad = _english_feedback_templates()
 
     if true_label == "good":
         keep = " ; ".join(random.sample(keep_good, k=min(2, len(keep_good))))
         improve = " ; ".join(random.sample(improve_good, k=min(2, len(improve_good))))
-        base = "Overall good technique—preserve the fundamentals and refine a couple of details."
     else:
         keep = " ; ".join(random.sample(keep_bad, k=min(2, len(keep_bad))))
         improve = " ; ".join(random.sample(improve_bad, k=min(2, len(improve_bad))))
-        base = "Technique needs improvement—focus on a few key fixes with controlled reps."
 
-    note = ""
-    if not correct:
-        note = "The model misclassified this example—consider a quick manual review."
-    elif confidence < 0.70:
-        note = "Lower confidence—this may be a borderline or challenging image (angle/lighting/occlusion)."
+    return {"llm_keep": keep, "llm_improve": improve}
 
-    summary = base if not note else f"{base} {note}"
-    return {"llm_keep": keep, "llm_improve": improve, "llm_summary": summary}
 
 def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
-    keeps, improves, sums = [], [], []
+    keeps, improves = [], []
     for _, r in df.iterrows():
         fb = llm_feedback_for_row(
             true_label=str(r.get("true_label", "")),
@@ -1190,11 +1223,9 @@ def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
         keeps.append(fb["llm_keep"])
         improves.append(fb["llm_improve"])
-        sums.append(fb["llm_summary"])
 
     df["llm_keep"] = keeps
     df["llm_improve"] = improves
-    df["llm_summary"] = sums
     return df
 
 
@@ -1220,7 +1251,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     rows: List[Dict[str, Any]] = []
     all_y: List[int] = []
     all_p: List[int] = []
-    p_good_list: List[float] = []  
 
     with torch.no_grad():
         for x, y, names in loader:
@@ -1235,7 +1265,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
                 true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
                 conf = float(np.max(probs[j]))
-                p_good = float(probs[j][1])
 
                 rows.append({
                     "image_name": names[j],
@@ -1247,7 +1276,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
                 all_y.append(true_y)
                 all_p.append(pred_y)
-                p_good_list.append(p_good)
 
     df = pd.DataFrame(rows)
 
@@ -1278,27 +1306,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
     plt.close()
-
-    try:
-        y_true = np.array(all_y, dtype=np.int32)
-        y_scores = np.array(p_good_list, dtype=np.float32)
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        roc_auc = auc(fpr, tpr)
-
-        plt.figure(figsize=(7, 5))
-        plt.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.2f}")
-        plt.plot([0, 1], [0, 1], lw=2, linestyle="--")
-        plt.xlim([0, 1])
-        plt.ylim([0, 1.05])
-        plt.xlabel("FPR")
-        plt.ylabel("TPR")
-        plt.title(f"ROC ({split_name})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
-        plt.close()
-    except Exception as e:
-        print(f"⚠️ ROC plot skipped: {e}")
 
     rep_txt = classification_report(
         all_y, all_p,
@@ -1357,7 +1364,6 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append("- outputs/val_predictions.csv\n")
     lines.append("- outputs/confidence_dist_val.png\n")
     lines.append("- outputs/confusion_val.png\n")
-    lines.append("- outputs/roc_curve_val.png\n")
     lines.append("- outputs/README.md\n")
 
     if note.strip():
@@ -1404,23 +1410,11 @@ def main():
         print(" Tip: set ENABLE_GENERATION=1 to force generation (CUDA recommended).")
         return
 
-    if os.environ.get("SKIP_TRAIN", "0") == "1":
-        print(" SKIP_TRAIN=1 -> skipping training, trying to load outputs/vit_squat_best.pth")
-        best_path = OUTPUT_DIR / "vit_squat_best.pth"
-        if not best_path.exists():
-            print(" No best model found.")
-            return
-        model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-        model.heads.head = nn.Linear(model.heads.head.in_features, 2)
-        model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-        model.to(DEVICE)
-        _, transform = _make_transforms()
-        train_info = {}
-    else:
-        model, transform, train_info = train_vit()
-        if model is None or transform is None:
-            print("Training failed.")
-            return
+    model, transform, train_info = train_vit()
+    if model is None or transform is None:
+        print("Training failed.")
+        return
+
 
     summaries: List[Dict] = []
     _, val_summary = evaluate_split(model, VAL_DIR, "val", transform)
@@ -1431,8 +1425,7 @@ def main():
         print(f"{s['split']}: accuracy={s['accuracy']:.4f} (n={s.get('n', 0)})")
 
     note = "Generation uses 3D pose extraction + 3D pose manipulation (dragging + rotations) + ControlNet Img2Img. Training uses ViT fine-tuning with cosine LR, label smoothing, optional mixup, early stopping."
-    if train_info:
-        note += f"\nTrain artifacts (created then pruned in minimal mode): {train_info}"
+
 
     write_readme(summaries, note=note)
 
