@@ -11,6 +11,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
+from sklearn.metrics import roc_curve, auc
+
 
 from sklearn.metrics import confusion_matrix, classification_report
 from dotenv import load_dotenv 
@@ -300,6 +302,7 @@ def allowed_output_files() -> set:
         "val_predictions.csv",
         "confidence_dist_val.png",
         "confusion_val.png",
+        "roc_curve_val.png",
         "README.md",
     }
 
@@ -1228,19 +1231,20 @@ def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["llm_improve"] = improves
     return df
 
-
 def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform) -> Tuple[pd.DataFrame, Dict]:
     """
     Evaluates a split directory (train/val/test), writes:
       - outputs/{split_name}_predictions.csv  (ONLY requested columns)
       - outputs/confusion_{split_name}.png
       - outputs/confidence_dist_{split_name}.png
-      - outputs/roc_curve_{split_name}.png   (computed internally, not saved in CSV)
+      - outputs/roc_curve_{split_name}.png
 
     Returns:
       df (with ONLY requested columns)
-      summary dict (accuracy + f1 metrics + confusion matrix)
+      summary dict (accuracy + f1 metrics + confusion matrix + roc_auc)
     """
+    from sklearn.metrics import roc_curve, auc  # local import (or move to top)
+
     ds = SquatDataset(split_dir, transform=transform)
     if len(ds) == 0:
         return pd.DataFrame(), {"split": split_name, "note": "empty split"}
@@ -1251,6 +1255,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     rows: List[Dict[str, Any]] = []
     all_y: List[int] = []
     all_p: List[int] = []
+    all_score: List[float] = []  # score for class "good" (positive)
 
     with torch.no_grad():
         for x, y, names in loader:
@@ -1264,7 +1269,9 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
             for j in range(len(names)):
                 true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
-                conf = float(np.max(probs[j]))
+
+                score_good = float(probs[j][1])     # P(good)
+                conf = float(np.max(probs[j]))      # confidence in chosen class
 
                 rows.append({
                     "image_name": names[j],
@@ -1276,16 +1283,20 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
 
                 all_y.append(true_y)
                 all_p.append(pred_y)
+                all_score.append(score_good)
 
     df = pd.DataFrame(rows)
 
+    # add LLM feedback columns
     df = add_llm_columns(df)
 
     keep_cols = ["image_name", "true_label", "pred_label", "confidence", "correct", "llm_keep", "llm_improve"]
     df = df[keep_cols]
 
+    # save predictions csv
     df.to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
+    # confusion matrix
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
     save_confusion_matrix(
         cm,
@@ -1294,6 +1305,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
         title=f"Confusion Matrix ({split_name})"
     )
 
+    # confidence distribution plot
     plt.figure(figsize=(7, 5))
     corr = df[df["correct"] == True]["confidence"]
     incorr = df[df["correct"] == False]["confidence"]
@@ -1307,6 +1319,25 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
     plt.close()
 
+    # ROC curve + AUC (positive class = good=1)
+    y_true = np.array(all_y, dtype=np.int32)
+    y_score = np.array(all_score, dtype=np.float32)
+
+    fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(fpr, tpr, label=f"AUC={roc_auc:.2f}")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title(f"ROC ({split_name})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
+    plt.close()
+
+    # classification report
     rep_txt = classification_report(
         all_y, all_p,
         labels=[0, 1],
@@ -1333,10 +1364,16 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
         "f1_good": float(rep["good"]["f1-score"]),
         "f1_macro": float(rep["macro avg"]["f1-score"]),
         "f1_weighted": float(rep["weighted avg"]["f1-score"]),
+        "roc_auc": float(roc_auc),
     }
 
-    print(f"\n[{split_name}] accuracy={summary['accuracy']:.4f} | f1_macro={summary['f1_macro']:.4f} | f1_weighted={summary['f1_weighted']:.4f}")
+    print(
+        f"\n[{split_name}] accuracy={summary['accuracy']:.4f} | "
+        f"f1_macro={summary['f1_macro']:.4f} | f1_weighted={summary['f1_weighted']:.4f} | "
+        f"roc_auc={summary['roc_auc']:.4f}"
+    )
     return df, summary
+
 
 
 # ============================================================
@@ -1364,6 +1401,7 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append("- outputs/val_predictions.csv\n")
     lines.append("- outputs/confidence_dist_val.png\n")
     lines.append("- outputs/confusion_val.png\n")
+    lines.append("- outputs/roc_curve_val.png\n")
     lines.append("- outputs/README.md\n")
 
     if note.strip():
