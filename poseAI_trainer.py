@@ -12,13 +12,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from sklearn.metrics import roc_curve, auc
-
-
 from sklearn.metrics import confusion_matrix, classification_report
 from dotenv import load_dotenv 
-load_dotenv()
-# --- OpenAI (real LLM) ---
 from openai import OpenAI
+from dotenv import load_dotenv
+from pathlib import Path
+import os
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_PATH = SCRIPT_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+_key = os.environ.get("OPENAI_API_KEY", "").strip()
+print("Loaded .env from:", ENV_PATH)
+print("OPENAI_API_KEY present?", bool(_key), "len=", len(_key))
+
 
 _OPENAI_CLIENT: Optional[OpenAI] = None
 
@@ -32,10 +40,7 @@ def _get_openai_client() -> Optional[OpenAI]:
     return _OPENAI_CLIENT
 
 def llm_feedback_for_row_openai(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
-    """
-    Uses OpenAI API (gpt-4o-mini) and returns:
-    {"llm_keep": "...", "llm_improve": "..."}
-    """
+    """Uses OpenAI API (gpt-4o-mini)"""
     client = _get_openai_client()
     if client is None:
         raise RuntimeError("OPENAI_API_KEY is missing")
@@ -96,7 +101,7 @@ Rules:
 # ============================================================
 def _in_colab() -> bool:
     try:
-        import google.colab  # type: ignore
+        import google.colab  
         return True
     except Exception:
         return False
@@ -1022,7 +1027,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     no_improve = 0
     best_state_dict = None
 
-    # --- Warmup ---
     for epoch in range(cfg.WARMUP_EPOCHS):
         model.train()
         set_lr(cfg.LR_WARMUP)
@@ -1064,7 +1068,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         else:
             no_improve += 1
 
-    # --- Finetune ---
     _unfreeze_last_blocks(model, n_blocks=cfg.UNFREEZE_LAST_BLOCKS)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1133,8 +1136,6 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
     print(f"Training complete. Best val acc={best_val_acc:.4f}")
     return model, eval_tf, {"best_val_acc": best_val_acc}
 
-
-
 # ============================================================
 # 10) Evaluation + plots + LLM-like feedback columns
 # ============================================================
@@ -1200,9 +1201,8 @@ def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, co
         try:
             return llm_feedback_for_row_openai(true_label, pred_label, confidence, correct)
         except Exception as e:
-            print(f"⚠️ OpenAI LLM failed, falling back to templates: {e}")
+            print(f"OpenAI LLM failed, falling back to templates: {e}")
 
-    # fallback (your existing templates)
     keep_good, improve_good, keep_bad, improve_bad = _english_feedback_templates()
 
     if true_label == "good":
@@ -1243,7 +1243,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
       df (with ONLY requested columns)
       summary dict (accuracy + f1 metrics + confusion matrix + roc_auc)
     """
-    from sklearn.metrics import roc_curve, auc  # local import (or move to top)
+    from sklearn.metrics import roc_curve, auc 
 
     ds = SquatDataset(split_dir, transform=transform)
     if len(ds) == 0:
@@ -1255,7 +1255,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     rows: List[Dict[str, Any]] = []
     all_y: List[int] = []
     all_p: List[int] = []
-    all_score: List[float] = []  # score for class "good" (positive)
+    all_score: List[float] = []  
 
     with torch.no_grad():
         for x, y, names in loader:
@@ -1263,15 +1263,15 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
             y_t = y.to(DEVICE) if torch.is_tensor(y) else torch.tensor(y, device=DEVICE)
 
             logits = model(x)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()  # shape: [B, 2]
+            probs = torch.softmax(logits, dim=1).cpu().numpy()  
             pred = np.argmax(probs, axis=1)
 
             for j in range(len(names)):
                 true_y = int(y_t[j].item())
                 pred_y = int(pred[j])
 
-                score_good = float(probs[j][1])     # P(good)
-                conf = float(np.max(probs[j]))      # confidence in chosen class
+                score_good = float(probs[j][1])   
+                conf = float(np.max(probs[j]))     
 
                 rows.append({
                     "image_name": names[j],
@@ -1286,17 +1286,13 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
                 all_score.append(score_good)
 
     df = pd.DataFrame(rows)
-
-    # add LLM feedback columns
     df = add_llm_columns(df)
 
     keep_cols = ["image_name", "true_label", "pred_label", "confidence", "correct", "llm_keep", "llm_improve"]
     df = df[keep_cols]
 
-    # save predictions csv
     df.to_csv(OUTPUT_DIR / f"{split_name}_predictions.csv", index=False)
 
-    # confusion matrix
     cm = confusion_matrix(all_y, all_p, labels=[0, 1])
     save_confusion_matrix(
         cm,
@@ -1305,7 +1301,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
         title=f"Confusion Matrix ({split_name})"
     )
 
-    # confidence distribution plot
     plt.figure(figsize=(7, 5))
     corr = df[df["correct"] == True]["confidence"]
     incorr = df[df["correct"] == False]["confidence"]
@@ -1319,7 +1314,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
     plt.close()
 
-    # ROC curve + AUC (positive class = good=1)
     y_true = np.array(all_y, dtype=np.int32)
     y_score = np.array(all_score, dtype=np.float32)
 
@@ -1337,7 +1331,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     plt.savefig(OUTPUT_DIR / f"roc_curve_{split_name}.png", dpi=150)
     plt.close()
 
-    # classification report
     rep_txt = classification_report(
         all_y, all_p,
         labels=[0, 1],
@@ -1374,8 +1367,6 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     )
     return df, summary
 
-
-
 # ============================================================
 # 11) README (minimal)
 # ============================================================
@@ -1396,7 +1387,6 @@ def write_readme(summaries: List[Dict], note: str = ""):
     lines.append(f"- UNFREEZE_LAST_BLOCKS: {cfg.UNFREEZE_LAST_BLOCKS}\n")
     lines.append(f"- MIXUP_ALPHA: {cfg.MIXUP_ALPHA}\n")
     lines.append(f"- LABEL_SMOOTHING: {cfg.LABEL_SMOOTHING}\n")
-
     lines.append("\n## Outputs\n")
     lines.append("- outputs/val_predictions.csv\n")
     lines.append("- outputs/confidence_dist_val.png\n")
