@@ -58,7 +58,7 @@ Based on the validation analysis:
 ## 📂 Repository Structure
 * `proposal_presentation/, interim_presentation/, final_presentation/`: Project presentation files across different stages (PPTX/PDF).
 * `outputs/`: EDA graphs, confusion matrix, and best model weights (`vit_squat_best.pth`).
-* `project_url_drive.txt`: A text file containing the link to download the organized project from Google Drive.
+* `project_url_drive.txt`: A text file containing the link to download the organized project from Google Drive.  *(Note: The Drive folder includes a comprehensive project walkthrough video created via NotebookLLM)*.
 * `poseAI_trainer.py`: Main execution script.
 * `synthetic_dataset_*.zip`: Full synthetic datasets split into archives.
 
@@ -68,4 +68,5 @@ Based on the validation analysis:
 * Rotem Pasharel
 * Nofar Hatam
 * May Eden
+
 
