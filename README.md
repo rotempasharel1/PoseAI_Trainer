@@ -1,4 +1,5 @@
 # PoseAI Trainer 🏋️‍♂️
+<img width="752" height="550" alt="unnamed" src="https://github.com/user-attachments/assets/83752a97-7f20-4eba-93f7-feb3ad99b16f" />
 
 ## 📖 Project Motivation
 Performing physical exercises without proper guidance often leads to incorrect form and potential injuries. The PoseAI Trainer provides an AI-driven model for correcting squat technique, serving as a digital alternative to a human trainer.By training on high-fidelity synthetic data, the model delivers accurate feedback to help ensure safety and improve athletic performance.
@@ -54,10 +55,8 @@ Based on the validation analysis:
   <img width="33%" height="300" alt="confidence_dist_val" src="https://github.com/user-attachments/assets/c715e9f3-90ed-43a9-9520-b9898ecee6cd" />
 </p>
 
-
-
 ## 📂 Repository Structure
-* `/interim_report_presentation`: Project presentation files (PPTX/PDF).
+* `proposal_presentation/, interim_presentation/, final_presentation/`: Project presentation files across different stages (PPTX/PDF).
 * `outputs/`: EDA graphs, confusion matrix, and best model weights (`vit_squat_best.pth`).
 * `project_url_drive.txt`: A text file containing the link to download the organized project from Google Drive.
 * `poseAI_trainer.py`: Main execution script.
@@ -69,3 +68,4 @@ Based on the validation analysis:
 * Rotem Pasharel
 * Nofar Hatam
 * May Eden
+
