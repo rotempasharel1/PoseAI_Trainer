@@ -31,6 +31,7 @@ print("OPENAI_API_KEY present?", bool(_key), "len=", len(_key))
 _OPENAI_CLIENT: Optional[OpenAI] = None
 
 def _get_openai_client() -> Optional[OpenAI]:
+    """Lazy singleton pattern for OpenAI client - initializes once and reuses."""
     global _OPENAI_CLIENT
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -123,6 +124,7 @@ def _maybe_fix_shadowing(package_name: str):
                 print(" Failed to rename shadowing file/folder:", e)
 
 def ensure_deps():
+    """installs required packages"""
     needed = [
         "mediapipe>=0.10.14",
         "diffusers>=0.29.0",
@@ -397,8 +399,14 @@ class SkeletonNode:
             parent.children.append(self)
 
 def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, SkeletonNode], Dict[int, np.ndarray]]:
+    """
+    Constructs a hierarchical skeleton tree from MediaPipe 3D landmarks.
+    All positions are centered at mid-hip (pelvis) as the root origin.
+    Returns: (root_node, name→node map, landmark_idx→position dict)
+    """
     lms = world_landmarks.landmark
 
+    # Compute virtual joints at pelvis and torso center
     LH = mp_pose.PoseLandmark.LEFT_HIP.value
     RH = mp_pose.PoseLandmark.RIGHT_HIP.value
     LS = mp_pose.PoseLandmark.LEFT_SHOULDER.value
@@ -457,6 +465,7 @@ def build_skeleton_tree(world_landmarks) -> Tuple[SkeletonNode, Dict[str, Skelet
     return root, node_map, base_pts
 
 def clone_skeleton(root: SkeletonNode, base_pts: Dict[int, np.ndarray]) -> Tuple[SkeletonNode, Dict[str, SkeletonNode], Dict[int, np.ndarray]]:
+    """Deep-copies the skeleton tree"""
     node_map: Dict[str, SkeletonNode] = {}
     def _clone(node: SkeletonNode, parent: Optional[SkeletonNode]) -> SkeletonNode:
         nn_ = SkeletonNode(node.name, parent, node.landmark_idx)
@@ -514,10 +523,14 @@ def _norm(v: np.ndarray) -> float:
     return float(np.linalg.norm(v) + 1e-8)
 
 def drag_joint_keep_bone_length(node: SkeletonNode, target_world: np.ndarray):
+    """
+    Inverse kinematics helper: moves joint toward target position while
+    preserving the bone length constraint to its parent.
+    """
     if node.parent is None:
         return
     parent = node.parent
-    L = _norm(node.local_pos)
+    L = _norm(node.local_pos)  # Original bone length to preserve
     dir_vec = (target_world - parent.world_pos).astype(np.float32)
     d = _norm(dir_vec)
     if d < 1e-6:
@@ -536,9 +549,15 @@ def make_good_pose_jitter(root: SkeletonNode, node_map: Dict[str, SkeletonNode])
     update_world_positions(root)
 
 def make_bad_pose_3d(root: SkeletonNode, node_map: Dict[str, SkeletonNode]) -> List[str]:
+    """
+    Applies random biomechanical faults to simulate common squat form errors.
+    Each fault has a probability-weighted chance of being applied.
+    Returns list of fault names applied for metadata tracking.
+    """
     def rng(a, b): return random.uniform(a, b)
     faults: List[str] = []
 
+    # Stochastic fault selection - multiple faults can combine
     if random.random() < 0.85: faults.append("forward_lean")
     if random.random() < 0.75: faults.append("knee_valgus")
     if random.random() < 0.50: faults.append("heel_lift")
@@ -605,14 +624,19 @@ def sample_camera_params() -> Dict[str, float]:
 
 def project_3d_to_2d(points_3d: Dict[int, np.ndarray], cam: Dict[str, float],
                      width: int, height: int, margin: float) -> Dict[int, Dict[str, float]]:
+    """
+    Projects 3D skeleton points to 2D image coordinates using perspective projection.
+    Applies camera rotation and scales to fit within canvas margin.
+    """
     y = math.radians(cam["yaw"])
     p = math.radians(cam["pitch"])
     r = math.radians(cam["roll"])
 
+    # Rotation matrices: Yaw (Y-axis), Pitch (X-axis), Roll (Z-axis)
     Ry = np.array([[math.cos(y), 0, math.sin(y)], [0, 1, 0], [-math.sin(y), 0, math.cos(y)]], dtype=np.float32)
     Rp = np.array([[1, 0, 0], [0, math.cos(p), -math.sin(p)], [0, math.sin(p), math.cos(p)]], dtype=np.float32)
     Rr = np.array([[math.cos(r), -math.sin(r), 0], [math.sin(r), math.cos(r), 0], [0, 0, 1]], dtype=np.float32)
-    R = (Ry @ Rp @ Rr).astype(np.float32)
+    R = (Ry @ Rp @ Rr).astype(np.float32)  # Combined rotation: yaw first, then pitch, then roll
 
     cam_pos = (R @ np.array([0, 0, cam["distance"]], dtype=np.float32)).astype(np.float32)
     f = (height / 2.0) / math.tan(math.radians(cam["fov"]) / 2.0)
@@ -663,6 +687,10 @@ def draw_openpose_like(projected: Dict[int, Dict[str, float]], width: int, heigh
 # 7) Stage 1: SD Img2Img + ControlNet generation
 # ============================================================
 def load_pipe() -> StableDiffusionControlNetImg2ImgPipeline:
+    """
+    Initializes Stable Diffusion + ControlNet Img2Img pipeline with memory optimizations.
+    Uses attention slicing and xformers (if available)
+    """
     if DEVICE == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -717,6 +745,10 @@ def plan_targets(total_images: int) -> Dict[str, Dict[str, int]]:
     }
 
 def generate_synthetic_dataset(total_images: int):
+    """
+    Stage 1 main orchestrator: generates synthetic squat images from seed photos.
+    Pipeline: extract 3D pose → manipulate skeleton → project to 2D → ControlNet Img2Img.
+    """
     print(f"\n=== Stage 1: Synthetic dataset (3D pose → manipulate → ControlNet Img2Img) on {DEVICE} ===")
 
     if DEVICE != "cuda" and os.environ.get("ALLOW_CPU_GENERATION", "0") != "1":
@@ -923,10 +955,14 @@ def _make_transforms():
 # 9) Training
 # ============================================================
 def _unfreeze_last_blocks(model: nn.Module, n_blocks: int):
+    """
+    Selective gradient unfreezing for transfer learning.
+    Freezes all layers, then unfreezes classification head + last N transformer blocks.
+    """
     for p in model.parameters():
         p.requires_grad = False
     for p in model.heads.parameters():
-        p.requires_grad = True
+        p.requires_grad = True  # Always train the classification head
 
     n_blocks = max(0, int(n_blocks))
     if n_blocks > 0 and hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
@@ -967,6 +1003,12 @@ def _mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float) -> Tuple[torch.
     return x_mix, y_mix
 
 def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict[str, Any]]:
+    """
+    Two-phase ViT-B/16 training:
+    1. Warmup: frozen backbone, train only classification head
+    2. Finetune: unfreeze last N transformer blocks with cosine LR decay
+    Uses weighted sampling for class balance, optional mixup, and early stopping.
+    """
     print("\n=== Stage 2: Train ViT-B/16 on synthetic data (no extra output files) ===")
 
     train_tf, eval_tf = _make_transforms()
@@ -978,6 +1020,7 @@ def train_vit() -> Tuple[Optional[nn.Module], Optional[transforms.Compose], Dict
         print(" Missing training/val data in synthetic_dataset/.")
         return None, None, {}
 
+    # Weighted sampling for class imbalance: inverse frequency weighting
     ys = [y for _, y in train_ds.samples]
     n0 = max(1, sum(1 for y in ys if y == 0))
     n1 = max(1, sum(1 for y in ys if y == 1))
@@ -1193,9 +1236,9 @@ def _english_feedback_templates():
 
 def llm_feedback_for_row(true_label: str, pred_label: str, confidence: float, correct: bool) -> Dict[str, str]:
     """
-    Hybrid:
-    - If OPENAI_API_KEY exists + USE_OPENAI_LLM=1 -> use OpenAI (gpt-4o-mini)
-    - Else -> fallback to templates
+    Generates coaching feedback for each prediction.
+    Hybrid approach: tries OpenAI API (gpt-4o-mini) first, falls back to curated templates.
+    Returns dict with 'llm_keep' (what to maintain) and 'llm_improve' (areas to work on).
     """
     if os.environ.get("USE_OPENAI_LLM", "1") == "1":
         try:
@@ -1233,17 +1276,11 @@ def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform) -> Tuple[pd.DataFrame, Dict]:
     """
-    Evaluates a split directory (train/val/test), writes:
-      - outputs/{split_name}_predictions.csv  (ONLY requested columns)
-      - outputs/confusion_{split_name}.png
-      - outputs/confidence_dist_{split_name}.png
-      - outputs/roc_curve_{split_name}.png
-
-    Returns:
-      df (with ONLY requested columns)
-      summary dict (accuracy + f1 metrics + confusion matrix + roc_auc)
+    Evaluation of a dataset split with visualization and metrics.
+    Outputs: predictions CSV, confusion matrix, confidence distribution, ROC curve.
+    Adds LLM-generated coaching feedback columns to predictions.
     """
-    from sklearn.metrics import roc_curve, auc 
+    from sklearn.metrics import roc_curve, auc
 
     ds = SquatDataset(split_dir, transform=transform)
     if len(ds) == 0:
@@ -1314,6 +1351,7 @@ def evaluate_split(model: nn.Module, split_dir: Path, split_name: str, transform
     plt.savefig(OUTPUT_DIR / f"confidence_dist_{split_name}.png", dpi=150)
     plt.close()
 
+    # ROC curve: using P(good) as the score for positive class (label=1)
     y_true = np.array(all_y, dtype=np.int32)
     y_score = np.array(all_score, dtype=np.float32)
 
